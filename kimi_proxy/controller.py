@@ -9,10 +9,23 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 import aiohttp
 from aiohttp import web
+
+_DEBUG_LOG = Path(__file__).resolve().parent.parent / "kimi-proxy-debug.jsonl"
+
+
+def _debug_log(direction: str, data: Any) -> None:
+    """Append a debug record to the debug JSONL log."""
+    record = {"t": time.strftime("%H:%M:%S"), "dir": direction, "data": data}
+    try:
+        with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
 
 from .config import ProxyConfig
 from .instructions import inject_instructions
@@ -134,6 +147,8 @@ class ProxyController:
                 status=400,
             )
 
+        _debug_log("request_in", {"model": body.get("model"), "stream": body.get("stream"), "msg_count": len(body.get("messages", [])), "headers": dict(request.headers)})
+
         # --- Request transformation pipeline (collecting summary facts) ---
         original_model = body.get("model", "unknown")
         summary.msg_count = len(body.get("messages", []))
@@ -167,12 +182,14 @@ class ProxyController:
         summary.messages = messages
 
         # --- Send upstream ---
+        _debug_log("upstream_request", {"model": model, "stream": is_stream, "url": self._cfg.upstream_url})
         try:
             if is_stream:
                 return await self._stream_response(request, body, model, messages, t_start, summary)
             else:
                 return await self._handle_json(body, model, messages, t_start, summary)
         except UpstreamError as exc:
+            _debug_log("upstream_error", {"status": exc.status, "body": exc.body[:500]})
             summary.status = exc.status or 502
             summary.finish()
             print_summary(summary, self._cfg.console_enabled)
@@ -252,6 +269,7 @@ class ProxyController:
         transformer = create_transformer(self._cfg.think_mode, model)
         ttft: float | None = None
         usage_data: dict[str, Any] | None = None
+        chunk_count = 0
 
         try:
             async for raw_line in resp.content:
@@ -265,6 +283,7 @@ class ProxyController:
                 # Transform each SSE line
                 out_lines = transformer.transform_line(line if isinstance(line, bytes) else line.encode())
                 for out_line in out_lines:
+                    chunk_count += 1
                     # Intercept usage data
                     text = out_line.decode("utf-8", errors="replace")
                     if text.startswith("data: ") and '"usage"' in text:
@@ -285,6 +304,8 @@ class ProxyController:
             summary.status = "client disconnected"
         finally:
             resp.close()
+
+        _debug_log("stream_done", {"chunks_sent": chunk_count, "ttft_ms": ttft, "usage": usage_data})
 
         total_ms = (time.monotonic() - t_start) * 1000
 
@@ -315,8 +336,12 @@ class ProxyController:
         result = await self._upstream.post_json(body)
         total_ms = (time.monotonic() - t_start) * 1000
 
+        _debug_log("upstream_response", {"choices": len(result.get("choices", [])), "has_content": bool(result.get("choices", [{}])[0].get("message", {}).get("content")), "usage": result.get("usage")})
+
         # Transform reasoning_content
         result = transform_full_response(result, self._cfg.think_mode, model)
+
+        _debug_log("client_response", {"choices": len(result.get("choices", []))})
 
         # Logging + pretty console summary
         usage_data = result.get("usage")
