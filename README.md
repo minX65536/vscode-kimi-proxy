@@ -21,9 +21,9 @@ VS Code Copilot Chat supports custom OpenAI-compatible endpoints, but Kimi's rea
 - **JSONC config** — human-friendly config with comments
 - **Async & concurrent** — handles multiple simultaneous requests via aiohttp
 
-## Quick Start
+## Setup
 
-### 1. Install
+### 1. Install dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -31,13 +31,15 @@ pip install -r requirements.txt
 
 ### 2. Set your API key
 
-```bash
-export MOONSHOT_API_KEY="sk-your-key-here"
+Create a `.env` file in the project root:
+
+```
+MOONSHOT_API_KEY=sk-your-key-here
 ```
 
 Or edit `kimi-proxy.json` and set `"api_key"` directly.
 
-### 3. Run
+### 3. Run the proxy
 
 ```bash
 python kimi-proxy.py
@@ -45,15 +47,44 @@ python kimi-proxy.py
 
 The proxy starts on `http://127.0.0.1:8000` by default.
 
-### 4. Point VS Code to the proxy
+### 4. Configure VS Code
 
-In VS Code settings, set your OpenAI-compatible endpoint to:
+In VS Code, open **Copilot Chat** → click the model picker → **Manage Models** → **Add Models** → **Custom Endpoint**.
 
+Paste this configuration:
+
+```json
+[
+    {
+        "name": "KIMI",
+        "vendor": "customendpoint",
+        "apiKey": "any-value-proxy-overrides-it",
+        "apiType": "chat-completions",
+        "models": [
+            {
+                "id": "kimi-k3",
+                "name": "kimi-k3",
+                "url": "http://127.0.0.1:8000/v1",
+                "maxInputTokens": 120000,
+                "maxOutputTokens": 120000,
+                "toolCalling": true,
+                "vision": true,
+                "streaming": true,
+                "thinking": true,
+                "parameters": {
+                    "temperature": 1,
+                    "override": true
+                }
+            }
+        ]
+    }
+]
 ```
-http://127.0.0.1:8000/v1
-```
 
-Use any model name — the proxy will route it to Kimi.
+> **Notes:**
+> - `apiKey` can be any placeholder — the proxy replaces it with your real key from `.env`
+> - `url` must end with `/v1` — the proxy appends `/chat/completions` internally
+> - After adding, select **kimi-k3** from the model picker in Copilot Chat
 
 ## Configuration
 
