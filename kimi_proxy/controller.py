@@ -18,9 +18,21 @@ from aiohttp import web
 _DEBUG_LOG = Path(__file__).resolve().parent.parent / "kimi-proxy-debug.jsonl"
 
 
+def _sanitize(obj: Any) -> Any:
+    """Recursively redact API keys from a dict/list structure."""
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(item) for item in obj]
+    if isinstance(obj, str) and obj.startswith("Bearer "):
+        token = obj[7:]
+        return f"Bearer {token[:6]}<truncated>" if len(token) > 6 else "Bearer <redacted>"
+    return obj
+
+
 def _debug_log(direction: str, data: Any) -> None:
     """Append a debug record to the debug JSONL log."""
-    record = {"t": time.strftime("%H:%M:%S"), "dir": direction, "data": data}
+    record = {"t": time.strftime("%H:%M:%S"), "dir": direction, "data": _sanitize(data)}
     try:
         with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
