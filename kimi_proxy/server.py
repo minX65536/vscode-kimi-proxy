@@ -45,10 +45,32 @@ async def create_app(cfg: ProxyConfig) -> web.Application:
 
 def run_server(cfg: ProxyConfig) -> None:
     """Start the server (blocking call)."""
+    import errno
+    import sys
+
+    from . import console as c
+
     app = create_app(cfg)
-    web.run_app(
-        app,
-        host=cfg.listen_host,
-        port=cfg.listen_port,
-        print=None,  # Suppress default aiohttp banner
-    )
+    try:
+        web.run_app(
+            app,
+            host=cfg.listen_host,
+            port=cfg.listen_port,
+            print=None,  # Suppress default aiohttp banner
+        )
+    except OSError as exc:
+        if exc.errno in (errno.EADDRINUSE, 10048):  # 10048 = Windows WSAEADDRINUSE
+            print(
+                c.colorize(
+                    f"\n❌ Port {cfg.listen_port} is already in use!\n"
+                    f"   Another instance may be running, or another app occupies the port.\n"
+                    f"   Try: netstat -ano | findstr :{cfg.listen_port}\n"
+                    f"   Or change listen_port in kimi-proxy.json\n",
+                    c.PINK,
+                    bold=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            sys.exit(1)
+        raise
