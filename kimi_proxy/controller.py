@@ -281,11 +281,14 @@ class ProxyController:
                     continue
 
                 # Transform each SSE line
+                raw_text = line if isinstance(line, str) else line.decode("utf-8", errors="replace")
+                _debug_log("sse_upstream", raw_text[:300])
                 out_lines = transformer.transform_line(line if isinstance(line, bytes) else line.encode())
                 for out_line in out_lines:
                     chunk_count += 1
-                    # Intercept usage data
                     text = out_line.decode("utf-8", errors="replace")
+                    _debug_log("sse_client", text[:300])
+                    # Intercept usage data
                     if text.startswith("data: ") and '"usage"' in text:
                         try:
                             payload = json.loads(text[6:].strip())

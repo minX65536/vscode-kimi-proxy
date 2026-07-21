@@ -105,8 +105,11 @@ class InlineThinkTransformer(ThinkTransformer):
 
         chunk_id = chunk.get("id", "unknown")
         choices = chunk.get("choices", [])
+
+        # Usage-only chunk (empty choices) — skip it; usage is already
+        # attached to the preceding finish_reason chunk by the code below.
         if not choices:
-            return [line]
+            return []
 
         delta = choices[0].get("delta", {})
         reasoning = delta.get("reasoning_content", "")
@@ -132,7 +135,7 @@ class InlineThinkTransformer(ThinkTransformer):
             out.append(sse_line(close_chunk))
 
         # Proxy content (strip reasoning_content from delta)
-        if content or delta.get("role") or choices[0].get("finish_reason"):
+        if content or delta.get("role") or delta.get("tool_calls") or choices[0].get("finish_reason"):
             clean_delta = {k: v for k, v in delta.items() if k != "reasoning_content"}
             clean_chunk = _make_chunk(
                 chunk_id,
@@ -194,7 +197,7 @@ class DropThinkTransformer(ThinkTransformer):
 
         choices = chunk.get("choices", [])
         if not choices:
-            return [line]
+            return []  # Skip usage-only chunks with empty choices
 
         delta = choices[0].get("delta", {})
         # Remove reasoning_content
