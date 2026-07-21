@@ -1,0 +1,84 @@
+{
+  // ================= NETWORK =================
+  // Address the proxy listens on (VS Code connects here)
+  "listen_host": "127.0.0.1",
+  "listen_port": 8000,
+
+  // Where the proxy forwards requests (Moonshot/Kimi API).
+  // For China: "https://api.moonshot.cn"
+  "upstream_base": "https://api.moonshot.ai",
+
+  // Name of the env variable holding the API key. If set,
+  // the proxy injects Authorization and IGNORES the client's key.
+  // Empty string "" = do not override the key.
+  "api_key_env": "MOONSHOT_API_KEY",
+
+  // ================= MODEL PARAMETERS =================
+  // Hard-override whatever the client sends, on every request
+  "force_params": {
+    "temperature": 1,
+    "top_p": 0.95
+    // "reasoning_effort": "high"  // uncomment to force thinking depth
+  },
+
+  // ================= THINKING =================
+  // How to display model reasoning:
+  //   "inline"  — inline in the text, wrapped in <think>...</think>
+  //   "details" — collapsible block <details> thinking </details>
+  //   "native"  — pass reasoning_content as-is (if the client renders it itself)
+  //   "drop"    — discard reasoning (saves bandwidth)
+  "think_mode": "inline",
+
+  // Strip past think-blocks from history before sending (saves context)
+  "strip_think_from_history": true,
+
+  // ================= INSTRUCTIONS =================
+  // Custom instructions for the model with HIGHEST priority.
+  // Inserted BEFORE IDE instructions in the system message.
+  // "" = do not add.
+  "custom_instructions": "",
+
+  // ================= MODELS =================
+  // Name remapping: "what the client sends": "what goes to the API".
+  // Handy so you don't have to edit VS Code settings when switching models.
+  "model_aliases": {
+    "kimi-k3": "kimi-k3"
+  },
+
+  // ================= OUTPUT =================
+  // Master switch for the pretty console output (banner + request summaries).
+  "console": true,
+  // Verbose mode — kept for compatibility; console shows only when
+  // BOTH "console" and "verbose" are true.
+  "verbose": true,
+
+  // ================= LOGGING =================
+  // Master switch for ALL JSONL file logging (false = write nothing).
+  "logging_enabled": true,
+
+  // Usage log (jsonl): tokens per request. "" = off.
+  "usage_log": "kimi-proxy-usage.jsonl",
+  // Latency metrics (jsonl): ttft_ms, total_ms, status, attempts. "" = off.
+  "metrics_log": "kimi-proxy-metrics.jsonl",
+
+  // Prompt breakdown by category (system/user/assistant/tool/tool_args).
+  "usage_breakdown": true,
+  // Separate file for the breakdown; "" = same file as usage_log
+  "usage_breakdown_log": "",
+
+  // ================= RETRY =================
+  // Retry on 408/409/425/429/5xx and network errors.
+  // Retries only BEFORE the stream starts — no duplicate responses.
+  "retry": {
+    "max_attempts": 3,      // total attempts (1 = disabled)
+    "backoff": [2, 4, 8]    // pause in seconds between attempts (Retry-After takes priority)
+  },
+
+  // ================= CONTEXT (anti-400) =================
+  // Rough token estimate (chars/3); when max_tokens is exceeded,
+  // the MIDDLE of the history is dropped (kept: system + first message + last keep_last).
+  "context": {
+    "max_tokens": 0,   // 0 = disabled; e.g. 100000 for kimi-k3
+    "keep_last": 20    // how many recent messages are guaranteed to be kept
+  }
+}
