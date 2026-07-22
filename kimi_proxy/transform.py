@@ -95,7 +95,6 @@ class InlineThinkTransformer(ThinkTransformer):
         if payload == "[DONE]":
             out: list[bytes] = []
             out.extend(self.flush("done"))
-            out.append(b"data: [DONE]\n\n")
             return out
 
         try:
@@ -128,8 +127,8 @@ class InlineThinkTransformer(ThinkTransformer):
             rc_chunk = _make_chunk(chunk_id, self.model, {"content": reasoning})
             out.append(sse_line(rc_chunk))
 
-        # Close think-block when regular content appears
-        if content and self.state.in_think:
+        # Close think-block before content OR tool_calls (old v2 behavior)
+        if self.state.in_think and (content or delta.get("tool_calls")):
             self.state.in_think = False
             close_chunk = _make_chunk(chunk_id, self.model, {"content": self._close_marker()})
             out.append(sse_line(close_chunk))
@@ -188,7 +187,7 @@ class DropThinkTransformer(ThinkTransformer):
 
         payload = text[6:]
         if payload == "[DONE]":
-            return [line]
+            return []  # Already forwarded by controller; don't duplicate
 
         try:
             chunk = json.loads(payload)
@@ -260,6 +259,9 @@ def full_response_to_sse(body: dict[str, Any], model: str) -> list[bytes]:
     out: list[bytes] = []
 
     choices = body.get("choices", [])
+    if not choices:
+        return []
+
     for i, choice in enumerate(choices):
         msg = choice.get("message", {})
         delta: dict[str, Any] = {}
@@ -268,7 +270,10 @@ def full_response_to_sse(body: dict[str, Any], model: str) -> list[bytes]:
         if msg.get("content"):
             delta["content"] = msg["content"]
         if msg.get("tool_calls"):
-            delta["tool_calls"] = msg["tool_calls"]
+            tcs = msg["tool_calls"]
+            for idx, tc in enumerate(tcs):
+                tc.setdefault("index", idx)
+            delta["tool_calls"] = tcs
 
         finish = choice.get("finish_reason")
         chunk = _make_chunk(chunk_id, model, delta, finish_reason=finish)
