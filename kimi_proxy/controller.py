@@ -178,6 +178,12 @@ class ProxyController:
         body, stripped = self._strip_think_history(body)
         summary.stripped_think = stripped
 
+        body, nulled = self._strip_tool_call_content(body)
+        summary.nulled_tool_content = nulled
+
+        body, renamed = self._fix_empty_tool_names(body)
+        summary.renamed_tool_calls = renamed
+
         body, trimmed = _enforce_context_budget(
             body,
             self._cfg.context.max_tokens,
@@ -195,13 +201,15 @@ class ProxyController:
 
         # --- Send upstream ---
         _debug_log("upstream_request", {"model": model, "stream": is_stream, "url": self._cfg.upstream_url})
+        if self._cfg.debug_dump_body:
+            _debug_log("upstream_body", json.dumps(body, ensure_ascii=False))
         try:
             if is_stream:
                 return await self._stream_response(request, body, model, messages, t_start, summary)
             else:
                 return await self._handle_json(body, model, messages, t_start, summary)
         except UpstreamError as exc:
-            _debug_log("upstream_error", {"status": exc.status, "body": exc.body[:500]})
+            _debug_log("upstream_error", {"status": exc.status, "body": exc.body})
             summary.status = exc.status or 502
             summary.finish()
             print_summary(summary, self._cfg.console_enabled)
@@ -210,7 +218,7 @@ class ProxyController:
                     "error": {
                         "message": f"Upstream error: {exc.status}",
                         "type": "upstream_error",
-                        "body": exc.body[:500],
+                        "body": exc.body,
                     }
                 },
                 status=exc.status if exc.status >= 400 else 502,
@@ -231,6 +239,54 @@ class ProxyController:
         messages = body.get("messages", [])
         new_messages = inject_instructions(messages, self._cfg.custom_instructions)
         return {**body, "messages": new_messages}
+
+    def _strip_tool_call_content(self, body: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        """Remove the content key from assistant messages that carry tool_calls.
+
+        The Moonshot tokenizer rejects messages where tool_calls and any
+        content coexist ("Invalid request: tokenization failed"), so the
+        key is dropped entirely. Returns (body, count_fixed).
+        """
+        messages = body.get("messages", [])
+        new_messages = []
+        fixed = 0
+        for msg in messages:
+            if (
+                msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and msg.get("content") is not None
+            ):
+                msg = {k: v for k, v in msg.items() if k != "content"}
+                fixed += 1
+            new_messages.append(msg)
+        return {**body, "messages": new_messages}, fixed
+
+    def _fix_empty_tool_names(self, body: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        """Replace empty/missing tool_call function names with a placeholder.
+
+        The Moonshot tokenizer crashes ("Invalid request: tokenization
+        failed") on any tool_call whose function.name is empty. Returns
+        (body, count_fixed).
+        """
+        messages = body.get("messages", [])
+        new_messages = []
+        fixed = 0
+        for msg in messages:
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                changed = False
+                new_calls = []
+                for tc in tool_calls:
+                    fn = tc.get("function") or {}
+                    if not fn.get("name"):
+                        tc = {**tc, "function": {**fn, "name": "tool"}}
+                        changed = True
+                    new_calls.append(tc)
+                if changed:
+                    msg = {**msg, "tool_calls": new_calls}
+                    fixed += 1
+            new_messages.append(msg)
+        return {**body, "messages": new_messages}, fixed
 
     def _strip_think_history(self, body: dict[str, Any]) -> tuple[dict[str, Any], int]:
         """Strip think-blocks from message history. Returns (body, count_cleaned)."""
@@ -294,21 +350,22 @@ class ProxyController:
 
                 # Transform each SSE line
                 raw_text = line if isinstance(line, str) else line.decode("utf-8", errors="replace")
-                _debug_log("sse_upstream", raw_text[:300])
+                _debug_log("sse_upstream", raw_text)
+                # Intercept usage data from the RAW upstream line.
+                # Transformers may drop usage-only chunks (empty choices), so
+                # scanning transformed output would miss standalone usage chunks.
+                if raw_text.startswith("data: ") and '"usage"' in raw_text:
+                    try:
+                        payload = json.loads(raw_text[6:].strip())
+                        if isinstance(payload, dict) and payload.get("usage"):
+                            usage_data = payload["usage"]
+                    except (json.JSONDecodeError, KeyError):
+                        pass
                 out_lines = transformer.transform_line(line if isinstance(line, bytes) else line.encode())
                 for out_line in out_lines:
                     chunk_count += 1
                     text = out_line.decode("utf-8", errors="replace")
-                    _debug_log("sse_client", text[:300])
-                    # Intercept usage data
-                    if text.startswith("data: ") and '"usage"' in text:
-                        try:
-                            payload = json.loads(text[6:].strip())
-                            if "usage" in payload:
-                                usage_data = payload["usage"]
-                        except (json.JSONDecodeError, KeyError):
-                            pass
-
+                    _debug_log("sse_client", text)
                     await stream.write(out_line)
 
                 # If this is [DONE]
@@ -319,6 +376,10 @@ class ProxyController:
             summary.status = "client disconnected"
         finally:
             resp.close()
+            try:
+                await stream.write_eof()
+            except Exception:
+                pass
 
         _debug_log("stream_done", {"chunks_sent": chunk_count, "ttft_ms": ttft, "usage": usage_data})
 
