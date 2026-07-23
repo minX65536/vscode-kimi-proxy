@@ -48,6 +48,63 @@ CAT_ICONS = {
     "tool_args": "📦",
 }
 
+# ---------------------------------------------------------------------------
+#  Emoji mode (auto / on / off) with ASCII fallbacks
+# ---------------------------------------------------------------------------
+
+_EMOJI: bool = True  # resolved at startup via set_emoji_mode()
+
+# emoji -> ASCII fallback for terminals without emoji glyphs
+_FALLBACKS: dict[str, str] = {
+    "✨": "*", "🌊": "~", "📦": "#", "💭": "?", "🧩": "?", "🧠": "?", "🙈": "x",
+    "📨": ">", "🔀": "->", "🎛️": "*", "🎛": "*", "🕵️": "*", "🕵": "*",
+    "✂️": "x", "✂": "x", "🏷️": "#", "🏷": "#", "🗜️": "-", "🗜": "-",
+    "⏱️": "T", "⏱": "T", "⚡": "!", "🚀": "^", "🔢": "#", "📊": "=",
+    "✔": "+", "✖": "x", "🔁": "@", "🎧": "*", "🌐": "*", "📝": "*",
+    "🌙": "*", "⚠️": "!", "⚠": "!", "✅": "+", "❌": "x",
+    "👤": "@", "🤖": "R", "🔧": "w", "⚙️": "*", "⚙": "*",
+    "Σ": "=", "·": "|", "—": "-",
+}
+
+
+def set_emoji_mode(mode: str) -> None:
+    """Set emoji mode: 'on' | 'off' | 'auto' (auto = conservative heuristic)."""
+    global _EMOJI
+    if mode == "on":
+        _EMOJI = True
+    elif mode == "off":
+        _EMOJI = False
+    else:  # auto
+        _EMOJI = _detect_emoji_support()
+
+
+def _detect_emoji_support() -> bool:
+    """Heuristic: does this terminal likely render emoji?"""
+    # Windows Terminal and modern xterm almost always do
+    if os.environ.get("WT_SESSION"):
+        return True
+    term = (os.environ.get("TERM") or "").lower()
+    if "xterm" in term or "kitty" in term or "alacritty" in term or "wezterm" in term:
+        return True
+    # VS Code integrated terminal: depends on configured font — often lacks emoji
+    if os.environ.get("TERM_PROGRAM") == "vscode":
+        return False
+    # macOS Terminal.app / iTerm
+    if os.environ.get("TERM_PROGRAM") in ("Apple_Terminal", "iTerm.app"):
+        return True
+    # Linux console with UTF-8 locale usually has some emoji font
+    if sys.platform != "win32":
+        return True
+    # Legacy conhost / unknown — be safe
+    return False
+
+
+def icon(emoji: str, fallback: str = "") -> str:
+    """Return emoji if enabled, else ASCII fallback (lookup table or given)."""
+    if _EMOJI:
+        return emoji
+    return _FALLBACKS.get(emoji, fallback)
+
 
 def colorize(text: str, color: str, bold: bool = False) -> str:
     """Wrap text in an ANSI color."""
@@ -71,9 +128,41 @@ def gradient_line(width: int, char: str = "─") -> str:
 # ---------------------------------------------------------------------------
 
 def _visible_len(text: str) -> int:
-    """String length without ANSI escape sequences."""
+    """String display width without ANSI escapes.
+
+    Emoji presentation rules:
+    - Variation selectors (FE0E/FE0F) and ZWJ are zero-width.
+    - A base char followed by FE0F (emoji presentation) is width 2,
+      even if its East Asian width is neutral (⚙️, ✂️, 🏷️…).
+    - Wide/fullwidth chars (🤖, 🔧, ⏱…) are width 2.
+    """
     import re
-    return len(re.sub(r"\033\[[0-9;]*m", "", text))
+    import unicodedata
+
+    plain = re.sub(r"\033\[[0-9;]*m", "", text)
+    width = 0
+    pending_upgrade = False  # previous char may be upgraded by VS16
+    for ch in plain:
+        if ch == "\ufe0f":
+            if pending_upgrade:
+                width += 1  # upgrade previous neutral base to double-width
+            pending_upgrade = False
+            continue
+        if ch in ("\ufe0e", "\u200d"):  # text presentation / ZWJ — zero width
+            pending_upgrade = False
+            continue
+        if unicodedata.combining(ch):
+            pending_upgrade = False
+            continue
+        eaw = unicodedata.east_asian_width(ch)
+        if eaw in ("W", "F"):
+            width += 2
+            pending_upgrade = False
+        else:
+            width += 1
+            # Non-alphanumeric symbols may render as double-width emoji with VS16
+            pending_upgrade = not ch.isalnum() and ch not in " \t"
+    return width
 
 
 def _pad(text: str, width: int) -> str:
@@ -82,14 +171,58 @@ def _pad(text: str, width: int) -> str:
 
 
 def boxed(lines: list[str], width: int = 58, border_color: str = CORAL) -> str:
-    """Render lines inside a rounded box with a gradient header/footer."""
-    inner = width - 2  # space for "│ " and " │"... actually "│" on both sides
+    """Render lines inside a rounded box with a gradient header/footer.
+
+    The box grows to fit the longest line (never narrower than `width`,
+    never wider than the terminal).
+    """
+    content_w = max((_visible_len(line) for line in lines), default=0)
+    width = max(width, content_w + 4)  # "│ " + content + " │"
+    term_w = _term_width()
+    if width > term_w:
+        width = max(20, term_w)
+        lines = [_truncate(line, width - 4) for line in lines]
     top = f"{border_color}╭{gradient_line(width - 2)}{border_color}╮{RESET}"
     bottom = f"{border_color}╰{gradient_line(width - 2)}{border_color}╯{RESET}"
     body: list[str] = []
     for line in lines:
         body.append(f"{border_color}│{RESET} {_pad(line, width - 4)} {border_color}│{RESET}")
     return "\n".join([top, *body, bottom])
+
+
+def _term_width(default: int = 80) -> int:
+    """Terminal width in columns (fallback if not a TTY)."""
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return default
+
+
+def _truncate(text: str, max_width: int) -> str:
+    """Truncate an ANSI-colored string to a display width, preserving RESET."""
+    if _visible_len(text) <= max_width:
+        return text
+    out: list[str] = []
+    width = 0
+    i = 0
+    import re
+    ansi = re.compile(r"\033\[[0-9;]*m")
+    # Reserve 1 column for the ellipsis
+    limit = max_width - 1
+    while i < len(text) and width < limit:
+        m = ansi.match(text, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        ch = text[i]
+        w = _visible_len(ch)
+        if width + w > limit:
+            break
+        out.append(ch)
+        width += w
+        i += 1
+    return "".join(out) + "…" + RESET
 
 
 def bar(pct: float, width: int = 20, color: str = MINT) -> str:
@@ -130,13 +263,13 @@ def tok_per_sec(completion_tokens: int | None, total_ms: float | None) -> str:
 def status_chip(status: int | str) -> str:
     """Colored status label."""
     if status == 200 or status == "ok":
-        return colorize(" ✔ 200 OK ", MINT, bold=True)
-    return colorize(f" ✖ {status} ", PINK, bold=True)
+        return colorize(f" {icon('✔')} 200 OK ", MINT, bold=True)
+    return colorize(f" {icon('✖')} {status} ", PINK, bold=True)
 
 
 def think_chip(mode: str) -> str:
     """Colored think-mode label."""
     icons = {"inline": "💭", "details": "🧩", "native": "🧠", "drop": "🙈"}
-    icon = icons.get(mode, "💭")
+    ic = icon(icons.get(mode, "💭"))
     colors = {"inline": SKY, "details": LILAC, "native": MINT, "drop": GRAY}
-    return colorize(f"{icon} {mode}", colors.get(mode, SKY))
+    return colorize(f"{ic} {mode}", colors.get(mode, SKY))

@@ -18,7 +18,7 @@ DETAILS_CLOSE = "\n\n</details>\n\n"
 # Used by strip_think_from_history: removes both styles
 _THINK_RE = re.compile(
     r"<think>.*?</think>"
-    r"|<details><summary>Thinking…</summary>.*?</details>",
+    r"|<details><summary>.*?</summary>.*?</details>",
     re.DOTALL,
 )
 

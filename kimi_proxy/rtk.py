@@ -12,11 +12,13 @@ any failure silently falls back to the original (uncompressed) content.
 
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 import subprocess
-from dataclasses import dataclass
+import sys
+from pathlib import Path
+
+from .config import RtkConfig
 
 log = logging.getLogger(__name__)
 
@@ -43,17 +45,6 @@ _FORMAT_HINTS: list[tuple[list[str], str]] = [
 _MIN_LEN = 500
 
 
-@dataclass(frozen=True)
-class RtkConfig:
-    """RTK connector configuration (immutable)."""
-
-    enabled: bool = False
-    path: str = "rtk"  # binary path or name in PATH
-    timeout: float = 2.0  # seconds per invocation
-    min_length: int = _MIN_LEN  # chars; shorter content passes through
-    filters: tuple[str, ...] = ()  # empty = auto-detect only
-
-
 # ---------------------------------------------------------------------------
 #  Availability
 # ---------------------------------------------------------------------------
@@ -65,7 +56,6 @@ def find_rtk_binary(cfg: RtkConfig) -> str | None:
         if shutil.which(cfg.path):
             return cfg.path
         # Try as-is (absolute or relative path)
-        from pathlib import Path
         if Path(cfg.path).is_file():
             return str(Path(cfg.path).resolve())
         return None
@@ -118,6 +108,8 @@ def compress_text(
         return text, False
 
     cmd = [rtk_bin, "pipe", "--filter", filt]
+    # Prevent console window popup on Windows when proxy runs headless
+    _creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
         proc = subprocess.run(
             cmd,
@@ -125,6 +117,7 @@ def compress_text(
             capture_output=True,
             text=True,
             timeout=cfg.timeout,
+            creationflags=_creationflags,
         )
         if proc.returncode != 0:
             log.debug("rtk pipe exited %d: %s", proc.returncode, proc.stderr[:200])

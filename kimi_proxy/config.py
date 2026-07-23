@@ -206,7 +206,7 @@ class ProxyConfig:
             env_name = str(merged.get("api_key_env", "MOONSHOT_API_KEY"))
             api_key = os.environ.get(env_name, "")
 
-        return cls(
+        cfg = cls(
             listen_host=str(merged["listen_host"]),
             listen_port=int(merged["listen_port"]),
             upstream_base=str(merged["upstream_base"]).rstrip("/"),
@@ -229,6 +229,31 @@ class ProxyConfig:
             context=context,
             rtk=rtk,
         )
+        cfg._validate()
+        return cfg
+
+    # ------------------------------------------------------------------
+    #  Validation
+    # ------------------------------------------------------------------
+
+    def _validate(self) -> None:
+        """Raise ValueError on invalid config values."""
+        if not (1 <= self.listen_port <= 65535):
+            raise ValueError(f"listen_port must be 1-65535, got {self.listen_port}")
+        if self.think_mode not in ("inline", "details", "native", "drop"):
+            raise ValueError(
+                f"think_mode must be inline|details|native|drop, got {self.think_mode!r}"
+            )
+        if self.emoji not in ("auto", "on", "off"):
+            raise ValueError(f"emoji must be auto|on|off, got {self.emoji!r}")
+        if self.retry.max_attempts < 1:
+            raise ValueError(f"retry.max_attempts must be >= 1, got {self.retry.max_attempts}")
+        if not self.retry.backoff:
+            raise ValueError("retry.backoff must not be empty")
+        if self.rtk.timeout <= 0:
+            raise ValueError(f"rtk.timeout must be positive, got {self.rtk.timeout}")
+        if self.rtk.min_length < 0:
+            raise ValueError(f"rtk.min_length must be >= 0, got {self.rtk.min_length}")
 
     # ------------------------------------------------------------------
     #  Convenience properties

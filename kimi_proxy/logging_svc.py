@@ -87,6 +87,7 @@ class RequestSummary:
     renamed_tool_calls: int = 0     # assistant msgs with empty tool_call names fixed
     trimmed_msgs: int = 0           # messages dropped by the context budget
     rtk_compressed: int = 0        # tool outputs compressed via rtk
+    rtk_bytes_saved: int = 0       # chars saved by rtk compression
 
     # Upstream facts
     attempts: int = 1
@@ -142,7 +143,11 @@ class RequestSummary:
         if self.trimmed_msgs:
             pipe_bits.append(f"{c.SUNNY}{c.icon('🗜️')} -{self.trimmed_msgs} msgs{c.RESET}")
         if self.rtk_compressed:
-            pipe_bits.append(f"{c.SKY}{c.icon('🗜️')} rtk ×{self.rtk_compressed}{c.RESET}")
+            rtk_note = f"{c.SKY}{c.icon('🗜️')} rtk ×{self.rtk_compressed}{c.RESET}"
+            if self.rtk_bytes_saved:
+                kb = self.rtk_bytes_saved / 1024
+                rtk_note += f" {c.MINT}({kb:.1f} KB saved){c.RESET}"
+            pipe_bits.append(rtk_note)
 
         # Timing line
         speed = c.tok_per_sec(completion_t, self.total_ms)

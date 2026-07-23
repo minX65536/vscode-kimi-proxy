@@ -93,9 +93,9 @@
   // Compress tool-call outputs in history via the rtk CLI (Rust Token Killer).
   // Binary downloaded to bin/rtk.exe (v0.43.0, sha256 verified).
   "rtk": {
-    "enabled": false,       // master switch
+    "enabled": true,       // master switch
     "path": "bin/rtk.exe",  // binary name or full path
     "timeout": 2.0,         // seconds per invocation (fallback to original on timeout)
-    "min_length": 500       // chars; shorter tool outputs pass through unchanged
+    "min_length": 200       // chars; shorter tool outputs pass through unchanged
   }
 }

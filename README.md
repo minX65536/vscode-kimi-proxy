@@ -16,7 +16,7 @@ VS Code Copilot Chat supports custom OpenAI-compatible endpoints, but Kimi's rea
 - **Model aliasing** — remap model names without touching VS Code settings
 - **Force parameters** — override temperature, top_p, reasoning_effort on every request
 - **Context budget** — automatically trim message history to avoid 400 errors
-- **Tool output compression** — optional RTK integration compresses tool-call outputs in history (pytest, mypy, git, grep, cargo-test…) saving tokens on long sessions
+- **Tool output compression** — optional RTK integration compresses tool-call outputs in history (pytest, mypy, git, grep, cargo-test…) saving tokens on long sessions; saved bytes shown in console
 - **Retry with backoff** — automatic retry on 429/5xx and network errors (pre-stream only)
 - **Usage & metrics logging** — JSONL logs with token counts, TTFT, latency breakdown by message category
 - **JSONC config** — human-friendly config with comments
@@ -46,10 +46,16 @@ Or edit `kimi-proxy.json` and set `"api_key"` directly.
 python kimi-proxy.py
 ```
 
+Or as a module:
+
+```bash
+python -m kimi_proxy
+```
+
 Or point to a different config file:
 
 ```bash
-python kimi-proxy.py --config my.json
+python -m kimi_proxy --config my.json
 ```
 
 The proxy starts on `http://127.0.0.1:8000` by default. Exposed endpoints:
@@ -157,6 +163,20 @@ To enable, edit `kimi-proxy.json`:
   "timeout": 2.0,
   "min_length": 500
 }
+```
+
+**Console display:**
+
+When RTK is enabled, the startup banner shows its status and binary path:
+
+```
+🗜️ RTK        ✅ on   path: bin/rtk.exe
+```
+
+Each request summary shows the number of compressed outputs and bytes saved:
+
+```
+🗜️ rtk ×3  (12.4 KB saved)
 ```
 
 For other platforms, download from [RTK releases](https://github.com/rtk-ai/rtk/releases)

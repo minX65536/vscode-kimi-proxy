@@ -10,7 +10,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 import aiohttp
 from aiohttp import web
@@ -30,18 +30,24 @@ def _sanitize(obj: Any) -> Any:
     return obj
 
 
-def _debug_log(direction: str, data: Any) -> None:
-    """Append a debug record to the debug JSONL log."""
-    record = {"t": time.strftime("%H:%M:%S"), "dir": direction, "data": _sanitize(data)}
-    try:
-        with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-    except Exception:
-        pass
+def _make_debug_logger(cfg: ProxyConfig) -> Any:
+    """Return a debug logger function if debug_dump_body is enabled, else a no-op."""
+    if not cfg.debug_dump_body:
+        return lambda direction, data: None
+
+    def _debug_log(direction: str, data: Any) -> None:
+        record = {"t": time.strftime("%H:%M:%S"), "dir": direction, "data": _sanitize(data)}
+        try:
+            with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass
+
+    return _debug_log
 
 from .config import ProxyConfig
 from .instructions import inject_instructions
-from .logging_svc import MetricsLogger, RequestSummary, UsageLogger, print_summary
+from .logging_svc import MetricsLogger, RequestSummary, UsageLogger, _estimate_chars, print_summary
 from .rtk import compress_tool_outputs, find_rtk_binary
 from .thinking import strip_think
 from .transform import (
@@ -59,23 +65,6 @@ def _apply_model_alias(body: dict[str, Any], aliases: dict[str, str]) -> dict[st
     if model in aliases:
         body = {**body, "model": aliases[model]}
     return body
-
-
-def _estimate_messages_chars(messages: list[dict[str, Any]]) -> int:
-    """Char estimate including tool_calls arguments."""
-    total = 0
-    for m in messages:
-        if not isinstance(m, dict):
-            continue
-        c = m.get("content")
-        if isinstance(c, str):
-            total += len(c)
-        elif isinstance(c, list):
-            total += sum(len(str(p.get("text", ""))) for p in c if isinstance(p, dict))
-        for tc in m.get("tool_calls") or []:
-            if isinstance(tc, dict):
-                total += len(str((tc.get("function") or {}).get("arguments", "")))
-    return total
 
 
 def _enforce_context_budget(
@@ -98,7 +87,7 @@ def _enforce_context_budget(
     if not isinstance(messages, list) or not messages:
         return body, 0
 
-    est = _estimate_messages_chars(messages) // 3
+    est = sum(_estimate_chars(messages).values()) // 3
     if est <= max_tokens:
         return body, 0
 
@@ -132,6 +121,7 @@ class ProxyController:
         self._upstream = UpstreamClient(cfg, session)
         self._usage = usage_logger
         self._metrics = metrics_logger
+        self._debug_log = _make_debug_logger(cfg)
 
     async def handle_models(self, request: web.Request) -> web.Response:
         """GET /v1/models — proxy the model list."""
@@ -179,7 +169,7 @@ class ProxyController:
                 status=400,
             )
 
-        _debug_log("request_in", {"model": body.get("model"), "stream": body.get("stream"), "msg_count": len(body.get("messages", [])), "headers": client_headers})
+        self._debug_log("request_in", {"model": body.get("model"), "stream": body.get("stream"), "msg_count": len(body.get("messages", [])), "headers": client_headers})
 
         # --- Request transformation pipeline (collecting summary facts) ---
         original_model = body.get("model", "unknown")
@@ -210,10 +200,13 @@ class ProxyController:
             rtk_bin = find_rtk_binary(self._cfg.rtk)
             if rtk_bin:
                 messages_before = body.get("messages", [])
+                chars_before = sum(_estimate_chars(messages_before).values())
                 messages_after, rtk_count = compress_tool_outputs(messages_before, self._cfg.rtk, rtk_bin)
                 if rtk_count:
+                    chars_after = sum(_estimate_chars(messages_after).values())
                     body = {**body, "messages": messages_after}
                     summary.rtk_compressed = rtk_count
+                    summary.rtk_bytes_saved = max(0, chars_before - chars_after)
 
         model = body.get("model", "unknown")
         is_stream = body.get("stream", False)
@@ -224,16 +217,16 @@ class ProxyController:
         summary.messages = messages
 
         # --- Send upstream ---
-        _debug_log("upstream_request", {"model": model, "stream": is_stream, "url": self._cfg.upstream_url})
+        self._debug_log("upstream_request", {"model": model, "stream": is_stream, "url": self._cfg.upstream_url})
         if self._cfg.debug_dump_body:
-            _debug_log("upstream_body", json.dumps(body, ensure_ascii=False))
+            self._debug_log("upstream_body", json.dumps(body, ensure_ascii=False))
         try:
             if is_stream:
                 return await self._stream_response(request, body, model, messages, t_start, summary, client_headers)
             else:
                 return await self._handle_json(body, model, messages, t_start, summary, client_headers)
         except UpstreamError as exc:
-            _debug_log("upstream_error", {"status": exc.status, "body": exc.body})
+            self._debug_log("upstream_error", {"status": exc.status, "body": exc.body})
             summary.status = exc.status or 502
             summary.finish()
             print_summary(summary, self._cfg.console_enabled)
@@ -402,7 +395,7 @@ class ProxyController:
 
                 # Transform each SSE line
                 raw_text = line if isinstance(line, str) else line.decode("utf-8", errors="replace")
-                _debug_log("sse_upstream", raw_text)
+                self._debug_log("sse_upstream", raw_text)
                 # Intercept usage data from the RAW upstream line.
                 # Transformers may drop usage-only chunks (empty choices), so
                 # scanning transformed output would miss standalone usage chunks.
@@ -421,7 +414,7 @@ class ProxyController:
                         if isinstance(payload, dict) and payload.get("error"):
                             err = payload["error"]
                             err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                            _debug_log("sse_upstream_error", err_msg)
+                            self._debug_log("sse_upstream_error", err_msg)
                             from .transform import _make_chunk, sse_line as make_sse
                             err_chunk = _make_chunk(transformer.template, 0, {"content": f"\n\n[upstream error] {err_msg}"}, "stop")
                             await stream.write(make_sse(err_chunk))
@@ -443,7 +436,7 @@ class ProxyController:
                 for out_line in out_lines:
                     chunk_count += 1
                     text = out_line.decode("utf-8", errors="replace")
-                    _debug_log("sse_client", text)
+                    self._debug_log("sse_client", text)
                     await stream.write(out_line)
 
                 # If this is [DONE]
@@ -457,7 +450,7 @@ class ProxyController:
                     f"\n\n[proxy] Апстрим завершил стрим без choices (HTTP {resp.status}). "
                     f"Проверь upstream_base ({self._cfg.upstream_base}), API-ключ и имя модели."
                 )
-                _debug_log("stream_no_choices", {"status": resp.status})
+                self._debug_log("stream_no_choices", {"status": resp.status})
                 from .transform import _make_chunk, sse_line as make_sse
                 warn_chunk = _make_chunk(transformer.template, 0, {"content": warn_msg}, "stop")
                 await stream.write(make_sse(warn_chunk))
@@ -472,7 +465,7 @@ class ProxyController:
             except Exception:
                 pass
 
-        _debug_log("stream_done", {"chunks_sent": chunk_count, "ttft_ms": ttft, "usage": usage_data, "saw_choices": saw_choices})
+        self._debug_log("stream_done", {"chunks_sent": chunk_count, "ttft_ms": ttft, "usage": usage_data, "saw_choices": saw_choices})
 
         total_ms = (time.monotonic() - t_start) * 1000
 
@@ -504,12 +497,12 @@ class ProxyController:
         result = await self._upstream.post_json(body, client_headers)
         total_ms = (time.monotonic() - t_start) * 1000
 
-        _debug_log("upstream_response", {"choices": len(result.get("choices", [])), "has_content": bool(result.get("choices", [{}])[0].get("message", {}).get("content")), "usage": result.get("usage")})
+        self._debug_log("upstream_response", {"choices": len(result.get("choices", [])), "has_content": bool(result.get("choices", [{}])[0].get("message", {}).get("content")), "usage": result.get("usage")})
 
         # Transform reasoning_content
         result = transform_full_response(result, self._cfg.think_mode, model)
 
-        _debug_log("client_response", {"choices": len(result.get("choices", []))})
+        self._debug_log("client_response", {"choices": len(result.get("choices", []))})
 
         # Logging + pretty console summary
         usage_data = result.get("usage")

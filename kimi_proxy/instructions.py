@@ -14,26 +14,6 @@ AGENT_INSTRUCTION = (
 )
 
 
-def build_system_content(cfg_instructions: str, existing_system: str) -> str:
-    """Build the final system message content.
-
-    Priority order (top = highest):
-      1. custom_instructions from config (highest)
-      2. AGENT_INSTRUCTION (proxy-level instruction)
-      3. Original system prompt from the IDE
-    """
-    parts: list[str] = []
-    if cfg_instructions:
-        parts.append(cfg_instructions.strip())
-    if existing_system:
-        parts.append(existing_system.strip())
-    # AGENT_INSTRUCTION is appended (with leading \n)
-    result = "\n\n".join(parts)
-    if AGENT_INSTRUCTION.strip() not in result:
-        result += AGENT_INSTRUCTION
-    return result
-
-
 def inject_instructions(
     messages: list[dict[str, Any]],
     custom_instructions: str,
@@ -64,11 +44,17 @@ def inject_instructions(
             break
 
     if sys_idx >= 0:
+        # Prepend custom_instructions if provided and not already present
+        if custom_instructions and custom_instructions.strip() not in existing_system:
+            existing_system = custom_instructions.strip() + "\n\n" + existing_system
         # Append AGENT_INSTRUCTION if not already present
         existing_content = result[sys_idx].get("content", "")
         if isinstance(existing_content, str):
             if AGENT_INSTRUCTION.strip() not in existing_content:
-                result[sys_idx] = {**result[sys_idx], "content": existing_content + AGENT_INSTRUCTION}
+                result[sys_idx] = {**result[sys_idx], "content": existing_system + AGENT_INSTRUCTION}
+            elif custom_instructions:
+                # AGENT_INSTRUCTION was already there but custom_instructions was not
+                result[sys_idx] = {**result[sys_idx], "content": existing_system}
         elif isinstance(existing_content, list):
             joined = " ".join(
                 str(p.get("text", "")) for p in existing_content if isinstance(p, dict)
