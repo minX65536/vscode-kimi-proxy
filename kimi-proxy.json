@@ -51,10 +51,17 @@
   // Verbose mode — kept for compatibility; console shows only when
   // BOTH "console" and "verbose" are true.
   "verbose": true,
+  // Emoji in console output: "auto" | "on" | "off".
+  // auto = heuristic detection (off for VS Code integrated terminal).
+  "emoji": "auto",
 
   // ================= LOGGING =================
   // Master switch for ALL JSONL file logging (false = write nothing).
   "logging_enabled": true,
+
+  // Dump the outgoing upstream request body into kimi-proxy-debug.jsonl
+  // (temporary diagnostic for the "tokenization failed" 400 error).
+  "debug_dump_body": true,
 
   // Usage log (jsonl): tokens per request. "" = off.
   "usage_log": "kimi-proxy-usage.jsonl",
@@ -80,5 +87,15 @@
   "context": {
     "max_tokens": 0,   // 0 = disabled; e.g. 100000 for kimi-k3
     "keep_last": 20    // how many recent messages are guaranteed to be kept
+  },
+
+  // ================= RTK (tool output compression) =================
+  // Compress tool-call outputs in history via the rtk CLI (Rust Token Killer).
+  // Requires: cargo install rtk  (or download binary from GitHub releases)
+  "rtk": {
+    "enabled": false,       // master switch
+    "path": "rtk",          // binary name or full path
+    "timeout": 2.0,         // seconds per invocation (fallback to original on timeout)
+    "min_length": 500       // chars; shorter tool outputs pass through unchanged
   }
 }

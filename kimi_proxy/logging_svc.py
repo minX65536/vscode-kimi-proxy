@@ -83,7 +83,10 @@ class RequestSummary:
     forced_params: dict[str, Any] = field(default_factory=dict)
     instructions: str = ""          # which instructions won: custom / agent / ide / none
     stripped_think: int = 0         # assistant messages cleaned of think-blocks
+    nulled_tool_content: int = 0    # assistant msgs where content was nulled (tool_calls)
+    renamed_tool_calls: int = 0     # assistant msgs with empty tool_call names fixed
     trimmed_msgs: int = 0           # messages dropped by the context budget
+    rtk_compressed: int = 0        # tool outputs compressed via rtk
 
     # Upstream facts
     attempts: int = 1
@@ -108,45 +111,56 @@ class RequestSummary:
         prompt_t = u.get("prompt_tokens")
         completion_t = u.get("completion_tokens")
 
-        mode = "🌊 stream" if self.stream else "📦 json"
+        mode = f"{c.icon('🌊')} stream" if self.stream else f"{c.icon('📦')} json"
         header = (
-            f"{c.colorize('✨ REQUEST SUMMARY', c.CORAL, bold=True)}"
+            f"{c.colorize(c.icon('✨') + ' REQUEST SUMMARY', c.CORAL, bold=True)}"
             f"  {c.colorize(self.model, c.PEACH, bold=True)}"
-            f"  {c.GRAY}·{c.RESET} {mode}"
-            f"  {c.GRAY}·{c.RESET} {c.think_chip(self.think_mode)}"
+            f"  {c.GRAY}{c.icon('·')}{c.RESET} {mode}"
+            f"  {c.GRAY}{c.icon('·')}{c.RESET} {c.think_chip(self.think_mode)}"
         )
 
         # Pipeline line
-        pipe_bits = [f"{c.GRAY}📨 {self.msg_count} msgs{c.RESET}"]
+        pipe_bits = [f"{c.GRAY}{c.icon('📨')} {self.msg_count} msgs{c.RESET}"]
         if self.alias_from:
-            pipe_bits.append(f"{c.SKY}🔀 {self.alias_from} → {self.model}{c.RESET}")
+            pipe_bits.append(f"{c.SKY}{c.icon('🔀')} {self.alias_from} → {self.model}{c.RESET}")
         if self.forced_params:
             fp = " ".join(f"{k}={v}" for k, v in self.forced_params.items())
-            pipe_bits.append(f"{c.LILAC}🎛️  {fp}{c.RESET}")
-        instr_icons = {"custom": "📝 custom", "agent": "🕵️ agent", "ide": "💻 ide", "none": "—"}
+            pipe_bits.append(f"{c.LILAC}{c.icon('🎛️')} {fp}{c.RESET}")
+        instr_icons = {
+            "custom": f"{c.icon('📝')} custom",
+            "agent": f"{c.icon('🕵️')} agent",
+            "ide": f"{c.icon('💻', '#')} ide",
+            "none": "—",
+        }
         pipe_bits.append(f"{c.MINT}{instr_icons.get(self.instructions, self.instructions)}{c.RESET}")
         if self.stripped_think:
-            pipe_bits.append(f"{c.GRAY}✂️  think ×{self.stripped_think}{c.RESET}")
+            pipe_bits.append(f"{c.GRAY}{c.icon('✂️')} think ×{self.stripped_think}{c.RESET}")
+        if self.nulled_tool_content:
+            pipe_bits.append(f"{c.GRAY}{c.icon('🔧')} content→null ×{self.nulled_tool_content}{c.RESET}")
+        if self.renamed_tool_calls:
+            pipe_bits.append(f"{c.GRAY}{c.icon('🏷️')} name→tool ×{self.renamed_tool_calls}{c.RESET}")
         if self.trimmed_msgs:
-            pipe_bits.append(f"{c.SUNNY}🗜️  -{self.trimmed_msgs} msgs{c.RESET}")
+            pipe_bits.append(f"{c.SUNNY}{c.icon('🗜️')} -{self.trimmed_msgs} msgs{c.RESET}")
+        if self.rtk_compressed:
+            pipe_bits.append(f"{c.SKY}{c.icon('🗜️')} rtk ×{self.rtk_compressed}{c.RESET}")
 
         # Timing line
         speed = c.tok_per_sec(completion_t, self.total_ms)
-        retry_note = f"  {c.SUNNY}🔁 ×{self.attempts}{c.RESET}" if self.retried else ""
+        retry_note = f"  {c.SUNNY}{c.icon('🔁')} ×{self.attempts}{c.RESET}" if self.retried else ""
         timing = (
-            f"{c.SKY}⏱️  ttft {c.fmt_ms(self.ttft_ms)}{c.RESET}"
-            f"  {c.MINT}⚡ total {c.fmt_ms(self.total_ms)}{c.RESET}"
-            f"  {c.LILAC}🚀 {speed}{c.RESET}"
+            f"{c.SKY}{c.icon('⏱️')} ttft {c.fmt_ms(self.ttft_ms)}{c.RESET}"
+            f"  {c.MINT}{c.icon('⚡')} total {c.fmt_ms(self.total_ms)}{c.RESET}"
+            f"  {c.LILAC}{c.icon('🚀')} {speed.replace('—', c.icon('—'))}{c.RESET}"
             f"{retry_note}"
             f"  {c.status_chip(self.status)}"
         )
 
         # Tokens line
         tokens = (
-            f"{c.PEACH}🔢 tokens{c.RESET}  "
+            f"{c.PEACH}{c.icon('🔢')} tokens{c.RESET}  "
             f"{c.GRAY}in{c.RESET} {c.fmt_tokens(prompt_t)}"
             f"  {c.GRAY}out{c.RESET} {c.fmt_tokens(completion_t)}"
-            f"  {c.GRAY}Σ{c.RESET} {c.fmt_tokens(u.get('total_tokens'))}"
+            f"  {c.GRAY}{c.icon('Σ', '=')}{c.RESET} {c.fmt_tokens(u.get('total_tokens'))}"
         )
 
         lines = [header, "", "  ".join(pipe_bits), timing, tokens]
@@ -168,17 +182,21 @@ class RequestSummary:
         if total == 0:
             return []
 
-        out = [f"{c.GRAY}📊 prompt makeup{c.RESET}"]
-        for cat, chars in cats.items():
+        out = [f"{c.GRAY}{c.icon('📊')} prompt makeup{c.RESET}"]
+        # Estimate token column width for right-alignment
+        est = {cat: int(chars / 3) for cat, chars in cats.items() if chars}
+        max_tok_w = max((len(f"{t:,}") for t in est.values()), default=1)
+        # Sort by size descending for readability
+        for cat, chars in sorted(cats.items(), key=lambda kv: kv[1], reverse=True):
             if chars == 0:
                 continue
             pct = chars / total * 100
             color = c.CAT_COLORS.get(cat, c.GRAY)
-            icon = c.CAT_ICONS.get(cat, "•")
-            label = f"{icon} {cat:<10}"
+            tok = est[cat]
+            label = f"{cat:<10}"
             out.append(
-                f"{color}{label}{c.RESET} {c.bar(pct, width=18, color=color)}"
-                f" {c.GRAY}{pct:4.1f}%  ~{int(chars / 3):,} tok{c.RESET}"
+                f"  {color}{label}{c.RESET} {c.bar(pct, width=18, color=color)}"
+                f" {c.GRAY}{pct:5.1f}%  ~{tok:>{max_tok_w},} tok{c.RESET}"
             )
         return out
 

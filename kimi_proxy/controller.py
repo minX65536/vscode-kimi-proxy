@@ -42,6 +42,7 @@ def _debug_log(direction: str, data: Any) -> None:
 from .config import ProxyConfig
 from .instructions import inject_instructions
 from .logging_svc import MetricsLogger, RequestSummary, UsageLogger, print_summary
+from .rtk import compress_tool_outputs, find_rtk_binary
 from .thinking import strip_think
 from .transform import (
     create_transformer,
@@ -203,6 +204,16 @@ class ProxyController:
             self._cfg.context.keep_last,
         )
         summary.trimmed_msgs = trimmed
+
+        # RTK: compress tool outputs before sending upstream
+        if self._cfg.rtk.enabled:
+            rtk_bin = find_rtk_binary(self._cfg.rtk)
+            if rtk_bin:
+                messages_before = body.get("messages", [])
+                messages_after, rtk_count = compress_tool_outputs(messages_before, self._cfg.rtk, rtk_bin)
+                if rtk_count:
+                    body = {**body, "messages": messages_after}
+                    summary.rtk_compressed = rtk_count
 
         model = body.get("model", "unknown")
         is_stream = body.get("stream", False)

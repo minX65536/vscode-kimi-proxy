@@ -104,6 +104,7 @@ _DEFAULTS: dict[str, Any] = {
     "usage_log": "",
     "console": True,                  # master switch: pretty console output
     "verbose": True,
+    "emoji": "auto",                  # emoji in console: auto | on | off
     "metrics_log": "",
     "usage_breakdown": True,
     "usage_breakdown_log": "",
@@ -136,6 +137,14 @@ class ContextConfig:
 
 
 @dataclass(frozen=True)
+class RtkConfig:
+    enabled: bool = False
+    path: str = "rtk"              # binary path or name in PATH
+    timeout: float = 2.0           # seconds per invocation
+    min_length: int = 500          # chars; shorter content passes through
+
+
+@dataclass(frozen=True)
 class ProxyConfig:
     """Immutable proxy configuration."""
 
@@ -151,12 +160,15 @@ class ProxyConfig:
     usage_log: str = ""
     console: bool = True
     verbose: bool = True
+    emoji: str = "auto"  # auto | on | off
     metrics_log: str = ""
     usage_breakdown: bool = True
     usage_breakdown_log: str = ""
     logging_enabled: bool = True
+    debug_dump_body: bool = False
     retry: RetryConfig = field(default_factory=RetryConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    rtk: RtkConfig = field(default_factory=RtkConfig)
 
     # ------------------------------------------------------------------
     #  Factory
@@ -180,6 +192,13 @@ class ProxyConfig:
             max_tokens=int(ctx_raw.get("max_tokens", 0)),
             keep_last=int(ctx_raw.get("keep_last", 20)),
         )
+        rtk_raw = merged.get("rtk", {})
+        rtk = RtkConfig(
+            enabled=bool(rtk_raw.get("enabled", False)),
+            path=str(rtk_raw.get("path", "rtk")),
+            timeout=float(rtk_raw.get("timeout", 2.0)),
+            min_length=int(rtk_raw.get("min_length", 500)),
+        )
 
         # API key: config field first, then environment variable
         api_key = str(merged.get("api_key", ""))
@@ -200,12 +219,15 @@ class ProxyConfig:
             usage_log=str(merged.get("usage_log", "")),
             console=bool(merged.get("console", True)),
             verbose=bool(merged.get("verbose", True)),
+            emoji=str(merged.get("emoji", "auto")),
             metrics_log=str(merged.get("metrics_log", "")),
             usage_breakdown=bool(merged.get("usage_breakdown", True)),
             usage_breakdown_log=str(merged.get("usage_breakdown_log", "")),
             logging_enabled=bool(merged.get("logging_enabled", True)),
+            debug_dump_body=bool(merged.get("debug_dump_body", False)),
             retry=retry,
             context=context,
+            rtk=rtk,
         )
 
     # ------------------------------------------------------------------
