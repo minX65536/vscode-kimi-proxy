@@ -162,6 +162,17 @@ To enable, edit `kimi-proxy.json`:
 For other platforms, download from [RTK releases](https://github.com/rtk-ai/rtk/releases)
 and point `rtk.path` at the binary.
 
+**About RTK:**
+
+- **Author:** Patrick Szymkowiak / [rtk-ai](https://github.com/rtk-ai)
+- **License:** [Apache License 2.0](https://github.com/rtk-ai/rtk/blob/develop/LICENSE) — free for any use including commercial
+- **Bundled binary:** `bin/rtk.exe` (v0.43.0, x86_64-pc-windows-msvc, SHA-256 verified)
+- **Source:** [github.com/rtk-ai/rtk](https://github.com/rtk-ai/rtk)
+
+RTK is used as an external subprocess (stdin/stdout pipe) — no code from RTK
+is compiled into or linked with this project. The Apache 2.0 license permits
+this use without additional requirements.
+
 ## Think Modes
 
 | Mode | Output | Use case |
