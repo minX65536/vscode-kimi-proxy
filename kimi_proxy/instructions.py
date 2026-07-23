@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 AGENT_INSTRUCTION = (
-    "[AGENT]: You are in VS Code Agent Mode. Process tool outputs carefully. "
+    "\n[AGENT]: You are in VS Code Agent Mode. Process tool outputs carefully. "
     "Output your reasoning and final answers clearly."
 )
 
@@ -25,10 +25,13 @@ def build_system_content(cfg_instructions: str, existing_system: str) -> str:
     parts: list[str] = []
     if cfg_instructions:
         parts.append(cfg_instructions.strip())
-    parts.append(AGENT_INSTRUCTION)
     if existing_system:
         parts.append(existing_system.strip())
-    return "\n\n".join(parts)
+    # AGENT_INSTRUCTION is appended (with leading \n)
+    result = "\n\n".join(parts)
+    if AGENT_INSTRUCTION.strip() not in result:
+        result += AGENT_INSTRUCTION
+    return result
 
 
 def inject_instructions(
@@ -37,7 +40,7 @@ def inject_instructions(
 ) -> list[dict[str, Any]]:
     """Insert or update the system message with custom instructions.
 
-    If a system message already exists, its content is rewritten.
+    If a system message already exists, AGENT_INSTRUCTION is appended to it.
     If not, a new system message is inserted at position 0.
     """
     if not messages:
@@ -60,11 +63,22 @@ def inject_instructions(
                 )
             break
 
-    new_content = build_system_content(custom_instructions, existing_system)
-
     if sys_idx >= 0:
-        result[sys_idx] = {**result[sys_idx], "content": new_content}
+        # Append AGENT_INSTRUCTION if not already present
+        existing_content = result[sys_idx].get("content", "")
+        if isinstance(existing_content, str):
+            if AGENT_INSTRUCTION.strip() not in existing_content:
+                result[sys_idx] = {**result[sys_idx], "content": existing_content + AGENT_INSTRUCTION}
+        elif isinstance(existing_content, list):
+            joined = " ".join(
+                str(p.get("text", "")) for p in existing_content if isinstance(p, dict)
+            )
+            if AGENT_INSTRUCTION.strip() not in joined:
+                existing_content.append({"type": "text", "text": AGENT_INSTRUCTION})
     else:
-        result.insert(0, {"role": "system", "content": new_content})
+        default_content = "You are a helpful coding assistant." + AGENT_INSTRUCTION
+        if custom_instructions:
+            default_content = custom_instructions.strip() + "\n\n" + default_content
+        result.insert(0, {"role": "system", "content": default_content})
 
     return result

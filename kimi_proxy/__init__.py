@@ -16,4 +16,4 @@ Modules:
   __main__       — composition root and entry point
 """
 
-__version__ = "9.0"
+__version__ = "1.0.1"

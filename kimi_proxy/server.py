@@ -1,3 +1,4 @@
+
 # SPDX-License-Identifier: BSL-1.1
 # Copyright (c) 2026 BESTNYPRO INC
 # Licensed under the Business Source License 1.1 — see LICENSE file
@@ -9,6 +10,7 @@ from __future__ import annotations
 import aiohttp
 from aiohttp import web
 
+from . import __version__
 from .config import ProxyConfig
 from .controller import ProxyController
 from .logging_svc import MetricsLogger, UsageLogger
@@ -30,7 +32,7 @@ async def create_app(cfg: ProxyConfig) -> web.Application:
 
     # Health check
     async def health(request: web.Request) -> web.Response:
-        return web.json_response({"status": "ok", "version": "9.0"})
+        return web.json_response({"status": "ok", "version": __version__})
 
     app.router.add_get("/health", health)
 

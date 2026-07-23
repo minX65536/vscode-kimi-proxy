@@ -21,7 +21,7 @@ class UpstreamError(Exception):
     def __init__(self, status: int, body: str) -> None:
         self.status = status
         self.body = body
-        super().__init__(f"Upstream {status}: {body[:200]}")
+        super().__init__(f"Upstream {status}: {body[:1000]}")
 
 
 class UpstreamClient:
@@ -32,23 +32,53 @@ class UpstreamClient:
     - Returns SSE stream or full JSON
     """
 
-    # Status codes worth retrying
-    _RETRYABLE = {429, 500, 502, 503, 504}
+    # Status codes worth retrying (408, 409, 425, 429, or any 5xx)
+    _RETRYABLE = {408, 409, 425, 429}
 
     def __init__(self, cfg: ProxyConfig, session: aiohttp.ClientSession) -> None:
         self._cfg = cfg
         self._session = session
 
-    def _headers(self) -> dict[str, str]:
+    @staticmethod
+    def _is_retryable(status: int) -> bool:
+        """Retry rule: 408/409/425/429 or any 5xx."""
+        return status in UpstreamClient._RETRYABLE or status >= 500
+
+    def _retry_delay(self, resp: aiohttp.ClientResponse, attempt: int) -> float:
+        """Retry delay: Retry-After header takes priority, else backoff."""
+        backoff = self._cfg.retry_backoff[min(attempt, len(self._cfg.retry_backoff) - 1)]
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(float(retry_after), 60.0)
+            except ValueError:
+                pass
+        return min(float(backoff), 60.0)
+
+    def _headers(self, client_headers: dict[str, str] | None = None) -> dict[str, str]:
+        """Build upstream headers.
+
+        If cfg.api_key is set, it overrides the client's Authorization.
+        Otherwise, the client's Authorization header is forwarded.
+        """
         h: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
         }
         if self._cfg.api_key:
             h["Authorization"] = f"Bearer {self._cfg.api_key}"
+        elif client_headers:
+            # Forward the client's Authorization header (passthrough)
+            auth = client_headers.get("Authorization") or client_headers.get("authorization")
+            if auth:
+                h["Authorization"] = auth
         return h
 
-    async def post_stream(self, body: dict[str, Any]) -> tuple[aiohttp.ClientResponse, int]:
+    async def post_stream(
+        self,
+        body: dict[str, Any],
+        client_headers: dict[str, str] | None = None,
+    ) -> tuple[aiohttp.ClientResponse, int]:
         """POST with stream=true. Returns (response, attempts_used).
 
         Raises UpstreamError on non-retryable error or exhausted attempts.
@@ -60,9 +90,19 @@ class UpstreamClient:
                 resp = await self._session.post(
                     self._cfg.upstream_url,
                     json=body,
-                    headers=self._headers(),
+                    headers=self._headers(client_headers),
                     timeout=aiohttp.ClientTimeout(total=None, sock_read=300),
+                    allow_redirects=False,
                 )
+
+                # Detect redirects (usually means wrong upstream_base)
+                if 300 <= resp.status < 400:
+                    location = resp.headers.get("Location", "")
+                    raise UpstreamError(
+                        resp.status,
+                        f"Redirect {resp.status} -> {location}. "
+                        f"Check upstream_base ({self._cfg.upstream_base})",
+                    )
 
                 if resp.status == 200:
                     return resp, attempt + 1
@@ -71,13 +111,15 @@ class UpstreamClient:
                 err_body = await resp.text()
                 last_error = UpstreamError(resp.status, err_body)
 
-                if resp.status not in self._RETRYABLE:
+                if not self._is_retryable(resp.status):
                     raise last_error
 
-                # Retry
+                # Retry (Retry-After header takes priority)
                 if attempt < self._cfg.retry_attempts - 1:
-                    wait = self._cfg.retry_backoff[min(attempt, len(self._cfg.retry_backoff) - 1)]
-                    await asyncio.sleep(wait)
+                    await asyncio.sleep(self._retry_delay(resp, attempt))
+                    resp.close()
+                    continue
+                resp.close()
 
             except aiohttp.ClientError as exc:
                 last_error = UpstreamError(0, str(exc))
@@ -87,7 +129,11 @@ class UpstreamClient:
 
         raise last_error or UpstreamError(0, "Unknown error")
 
-    async def post_json(self, body: dict[str, Any]) -> dict[str, Any]:
+    async def post_json(
+        self,
+        body: dict[str, Any],
+        client_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         """POST without stream. Returns full JSON response."""
         body_nostream = {**body, "stream": False}
 
@@ -97,21 +143,29 @@ class UpstreamClient:
                 async with self._session.post(
                     self._cfg.upstream_url,
                     json=body_nostream,
-                    headers=self._headers(),
+                    headers=self._headers(client_headers),
                     timeout=aiohttp.ClientTimeout(total=120),
+                    allow_redirects=False,
                 ) as resp:
+                    if 300 <= resp.status < 400:
+                        location = resp.headers.get("Location", "")
+                        raise UpstreamError(
+                            resp.status,
+                            f"Redirect {resp.status} -> {location}. "
+                            f"Check upstream_base ({self._cfg.upstream_base})",
+                        )
+
                     if resp.status == 200:
                         return await resp.json()
 
                     err_body = await resp.text()
                     last_error = UpstreamError(resp.status, err_body)
 
-                    if resp.status not in self._RETRYABLE:
+                    if not self._is_retryable(resp.status):
                         raise last_error
 
                     if attempt < self._cfg.retry_attempts - 1:
-                        wait = self._cfg.retry_backoff[min(attempt, len(self._cfg.retry_backoff) - 1)]
-                        await asyncio.sleep(wait)
+                        await asyncio.sleep(self._retry_delay(resp, attempt))
 
             except aiohttp.ClientError as exc:
                 last_error = UpstreamError(0, str(exc))

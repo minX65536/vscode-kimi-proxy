@@ -10,10 +10,10 @@ import re
 from dataclasses import dataclass
 
 # Think-block markers (open/close)
-THINK_OPEN = "\n<think>\n"
-THINK_CLOSE = "\n</think>\n"
-DETAILS_OPEN = "\n<details><summary>Thinking…</summary>\n\n"
-DETAILS_CLOSE = "\n</details>\n"
+THINK_OPEN = "\n\n<think>\n"
+THINK_CLOSE = "\n</think>\n\n"
+DETAILS_OPEN = "\n\n<details><summary>💭 thinking</summary>\n\n"
+DETAILS_CLOSE = "\n\n</details>\n\n"
 
 # Used by strip_think_from_history: removes both styles
 _THINK_RE = re.compile(
@@ -48,10 +48,10 @@ class ThinkMarkers:
 
 
 class ThinkingState:
-    """Tracks think-block state during streaming."""
+    """Think-block state per choice.index within a stream."""
 
     def __init__(self) -> None:
-        self.in_think = False
+        self.open: set[int] = set()
 
     def reset(self) -> None:
-        self.in_think = False
+        self.open.clear()

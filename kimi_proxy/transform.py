@@ -4,7 +4,9 @@
 
 """SSE chunk and full-response transformation.
 
-Each ThinkTransformer is a strategy for a specific think_mode.
+In-place chunk mutation (preserves every upstream field, including
+tool_calls ids/index/type), think markers merged into the same delta,
+[DONE] and usage-only chunks forwarded verbatim.
 """
 
 from __future__ import annotations
@@ -17,20 +19,24 @@ from .thinking import ThinkMarkers, ThinkingState
 
 
 def _make_chunk(
-    chunk_id: str,
-    model: str,
+    template: dict[str, Any],
+    idx: int,
     delta: dict[str, Any],
     finish_reason: str | None = None,
 ) -> dict[str, Any]:
-    """Create an SSE chunk in OpenAI format."""
+    """Assemble an SSE chunk.
+
+    ``template`` is a dict with upstream ``id``/``created``/``model`` so the
+    synthetic chunk inherits the stream identity instead of getting new ones.
+    """
     return {
-        "id": chunk_id,
+        "id": template.get("id") or "chatcmpl-proxy",
         "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": model,
+        "created": template.get("created") or int(time.time()),
+        "model": template.get("model") or "kimi-k3",
         "choices": [
             {
-                "index": 0,
+                "index": idx,
                 "delta": delta,
                 "finish_reason": finish_reason,
             }
@@ -48,33 +54,61 @@ def sse_line(data: dict[str, Any]) -> bytes:
 # ---------------------------------------------------------------------------
 
 class ThinkTransformer:
-    """Base class for reasoning transformers."""
+    """In-place mutation, [DONE]/usage forwarded."""
 
     def __init__(self, model: str) -> None:
         self.model = model
         self.state = ThinkingState()
+        self.template: dict[str, Any] = {}  # id/created/model from the stream
 
-    def transform_line(self, line: bytes) -> list[bytes]:
-        """Process a single SSE line. Returns list of lines to send."""
-        raise NotImplementedError
-
-    def flush(self, chunk_id: str) -> list[bytes]:
-        """Finalization (close an unclosed think-block)."""
-        if self.state.in_think:
-            self.state.in_think = False
-            chunk = _make_chunk(chunk_id, self.model, {"content": self._close_marker()})
-            return [sse_line(chunk)]
-        return []
-
+    # -- markers ------------------------------------------------------
     def _open_marker(self) -> str:
-        raise NotImplementedError
+        return ""
 
     def _close_marker(self) -> str:
-        raise NotImplementedError
+        return ""
+
+    def _transform_chunk(self, chunk: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return chunks to emit (base: passthrough). May add synthetics."""
+        return [chunk]
+
+    # -- main entry ----------------------------------------------------
+    def transform_line(self, line: bytes) -> list[bytes]:
+        """Process one SSE line. Returns lines to forward to the client."""
+        text = line.decode("utf-8", errors="replace")
+        stripped = text.strip()
+        if not stripped.startswith("data:"):
+            return [line]
+
+        payload = stripped[5:].strip()
+        if payload == "[DONE]":
+            # [DONE] is forwarded to the client as-is.
+            return [b"data: [DONE]"]
+        if not payload:
+            return [line]
+
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            return [line]
+
+        if not isinstance(chunk, dict):
+            return [line]
+
+        # Keep stream identity for potential synthetic chunks
+        self.template = {
+            k: chunk.get(k) for k in ("id", "created", "model") if chunk.get(k)
+        }
+
+        if chunk.get("choices"):
+            return [sse_line(c) for c in self._transform_chunk(chunk)]
+
+        # usage-only / error chunks — forward as-is
+        return [sse_line(chunk)]
 
 
 class InlineThinkTransformer(ThinkTransformer):
-    """think_mode=inline: reasoning → <think>...</think> in content."""
+    """think_mode=inline: reasoning → <think>...</think> merged into delta."""
 
     def __init__(self, model: str) -> None:
         super().__init__(model)
@@ -86,68 +120,34 @@ class InlineThinkTransformer(ThinkTransformer):
     def _close_marker(self) -> str:
         return self.markers.close
 
-    def transform_line(self, line: bytes) -> list[bytes]:
-        text = line.decode("utf-8", errors="replace").strip()
-        if not text.startswith("data: "):
-            return [line]
+    def _transform_chunk(self, chunk: dict[str, Any]) -> list[dict[str, Any]]:
+        extra: list[dict[str, Any]] = []
+        for choice in chunk.get("choices") or []:
+            idx = choice.get("index", 0)
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
 
-        payload = text[6:]
-        if payload == "[DONE]":
-            out: list[bytes] = []
-            out.extend(self.flush("done"))
-            return out
-
-        try:
-            chunk = json.loads(payload)
-        except json.JSONDecodeError:
-            return [line]
-
-        chunk_id = chunk.get("id", "unknown")
-        choices = chunk.get("choices", [])
-
-        # Usage-only chunk (empty choices) — skip it; usage is already
-        # attached to the preceding finish_reason chunk by the code below.
-        if not choices:
-            return []
-
-        delta = choices[0].get("delta", {})
-        reasoning = delta.get("reasoning_content", "")
-        content = delta.get("content", "")
-
-        out: list[bytes] = []
-
-        # Open think-block on first reasoning token
-        if reasoning and not self.state.in_think:
-            self.state.in_think = True
-            open_chunk = _make_chunk(chunk_id, self.model, {"content": self._open_marker()})
-            out.append(sse_line(open_chunk))
-
-        # Proxy reasoning as content inside think-block
-        if reasoning:
-            rc_chunk = _make_chunk(chunk_id, self.model, {"content": reasoning})
-            out.append(sse_line(rc_chunk))
-
-        # Close think-block before content OR tool_calls (old v2 behavior)
-        if self.state.in_think and (content or delta.get("tool_calls")):
-            self.state.in_think = False
-            close_chunk = _make_chunk(chunk_id, self.model, {"content": self._close_marker()})
-            out.append(sse_line(close_chunk))
-
-        # Proxy content (strip reasoning_content from delta)
-        if content or delta.get("role") or delta.get("tool_calls") or choices[0].get("finish_reason"):
-            clean_delta = {k: v for k, v in delta.items() if k != "reasoning_content"}
-            clean_chunk = _make_chunk(
-                chunk_id,
-                self.model,
-                clean_delta,
-                finish_reason=choices[0].get("finish_reason"),
-            )
-            # Preserve usage if present
-            if "usage" in chunk:
-                clean_chunk["usage"] = chunk["usage"]
-            out.append(sse_line(clean_chunk))
-
-        return out if out else [line]
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                prefix = self._open_marker() if idx not in self.state.open else ""
+                self.state.open.add(idx)
+                new_delta = {k: v for k, v in delta.items() if k != "reasoning_content"}
+                new_delta["content"] = prefix + reasoning + (new_delta.get("content") or "")
+                choice["delta"] = new_delta
+            elif idx in self.state.open and (
+                delta.get("content") or delta.get("tool_calls") or choice.get("finish_reason")
+            ):
+                self.state.open.discard(idx)
+                if delta.get("content") is not None:
+                    delta["content"] = self._close_marker() + (delta.get("content") or "")
+                else:
+                    # tool_calls without content — close think via a separate
+                    # synthetic chunk so the tool_calls delta stays untouched.
+                    extra.append(
+                        _make_chunk(self.template, idx, {"content": self._close_marker()})
+                    )
+        return extra + [chunk]
 
 
 class DetailsThinkTransformer(InlineThinkTransformer):
@@ -161,51 +161,18 @@ class DetailsThinkTransformer(InlineThinkTransformer):
 class NativeThinkTransformer(ThinkTransformer):
     """think_mode=native: reasoning_content stays as-is (no transformation)."""
 
-    def _open_marker(self) -> str:
-        return ""
-
-    def _close_marker(self) -> str:
-        return ""
-
-    def transform_line(self, line: bytes) -> list[bytes]:
-        return [line]
-
 
 class DropThinkTransformer(ThinkTransformer):
     """think_mode=drop: reasoning_content is removed."""
 
-    def _open_marker(self) -> str:
-        return ""
-
-    def _close_marker(self) -> str:
-        return ""
-
-    def transform_line(self, line: bytes) -> list[bytes]:
-        text = line.decode("utf-8", errors="replace").strip()
-        if not text.startswith("data: "):
-            return [line]
-
-        payload = text[6:]
-        if payload == "[DONE]":
-            return []  # Already forwarded by controller; don't duplicate
-
-        try:
-            chunk = json.loads(payload)
-        except json.JSONDecodeError:
-            return [line]
-
-        choices = chunk.get("choices", [])
-        if not choices:
-            return []  # Skip usage-only chunks with empty choices
-
-        delta = choices[0].get("delta", {})
-        # Remove reasoning_content
-        clean_delta = {k: v for k, v in delta.items() if k != "reasoning_content"}
-        if clean_delta or choices[0].get("finish_reason"):
-            chunk["choices"][0]["delta"] = clean_delta
-            return [sse_line(chunk)]
-
-        return []  # Empty delta — don't send
+    def _transform_chunk(self, chunk: dict[str, Any]) -> list[dict[str, Any]]:
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta")
+            if isinstance(delta, dict) and delta.get("reasoning_content"):
+                choice["delta"] = {
+                    k: v for k, v in delta.items() if k != "reasoning_content"
+                }
+        return [chunk]
 
 
 # ---------------------------------------------------------------------------
@@ -236,56 +203,40 @@ def transform_full_response(body: dict[str, Any], mode: str, model: str) -> dict
         return body
 
     markers = ThinkMarkers.for_mode(mode)
-    choices = body.get("choices", [])
-    for choice in choices:
-        msg = choice.get("message", {})
-        reasoning = msg.pop("reasoning_content", "")
-        if not reasoning:
-            continue
-
-        content = msg.get("content", "")
-        if mode == "drop":
-            msg["content"] = content
-        else:
-            think_block = f"{markers.open}{reasoning}{markers.close}"
-            msg["content"] = f"{think_block}\n{content}" if content else think_block
+    for choice in body.get("choices") or []:
+        msg = choice.get("message")
+        if isinstance(msg, dict) and msg.get("reasoning_content"):
+            reasoning = msg.pop("reasoning_content")
+            content = msg.get("content") or ""
+            if mode == "drop":
+                msg["content"] = content
+            else:
+                msg["content"] = markers.open + reasoning + markers.close + content
 
     return body
 
 
 def full_response_to_sse(body: dict[str, Any], model: str) -> list[bytes]:
-    """Convert a full JSON response to an SSE stream."""
-    chunk_id = body.get("id", "converted")
-    out: list[bytes] = []
+    """Convert a full JSON response to an SSE stream.
 
-    choices = body.get("choices", [])
+    The caller is expected to have run transform_full_response() already.
+    """
+    choices = body.get("choices")
     if not choices:
         return []
 
-    for i, choice in enumerate(choices):
-        msg = choice.get("message", {})
-        delta: dict[str, Any] = {}
-        if msg.get("role"):
-            delta["role"] = msg["role"]
-        if msg.get("content"):
-            delta["content"] = msg["content"]
-        if msg.get("tool_calls"):
-            tcs = msg["tool_calls"]
-            for idx, tc in enumerate(tcs):
-                tc.setdefault("index", idx)
-            delta["tool_calls"] = tcs
+    template = {k: body.get(k) for k in ("id", "created", "model") if body.get(k)}
+    msg = dict(choices[0].get("message") or {})
+    msg.pop("reasoning_content", None)  # already wrapped by transform_full_response
+    content = msg.get("content") or ""
 
-        finish = choice.get("finish_reason")
-        chunk = _make_chunk(chunk_id, model, delta, finish_reason=finish)
-        chunk["choices"][0]["index"] = i
-        out.append(sse_line(chunk))
+    delta: dict[str, Any] = {"role": "assistant", "content": content}
+    if msg.get("tool_calls"):
+        delta["tool_calls"] = msg["tool_calls"]
+    finish = choices[0].get("finish_reason") or "stop"
 
-    # Usage
-    if "usage" in body:
-        usage_chunk = _make_chunk(chunk_id, model, {}, finish_reason=None)
-        usage_chunk["usage"] = body["usage"]
-        usage_chunk["choices"] = []
-        out.append(sse_line(usage_chunk))
-
-    out.append(b"data: [DONE]\n\n")
-    return out
+    return [
+        sse_line(_make_chunk(template, 0, delta)),
+        sse_line(_make_chunk(template, 0, {}, finish)),
+        b"data: [DONE]\n\n",
+    ]

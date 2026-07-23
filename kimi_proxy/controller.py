@@ -60,6 +60,23 @@ def _apply_model_alias(body: dict[str, Any], aliases: dict[str, str]) -> dict[st
     return body
 
 
+def _estimate_messages_chars(messages: list[dict[str, Any]]) -> int:
+    """Char estimate including tool_calls arguments."""
+    total = 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            total += sum(len(str(p.get("text", ""))) for p in c if isinstance(p, dict))
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict):
+                total += len(str((tc.get("function") or {}).get("arguments", "")))
+    return total
+
+
 def _enforce_context_budget(
     body: dict[str, Any],
     max_tokens: int,
@@ -67,43 +84,37 @@ def _enforce_context_budget(
 ) -> tuple[dict[str, Any], int]:
     """Trim message history if the context budget is exceeded.
 
+    Trims ONLY when the rough estimate (chars/3) exceeds max_tokens.
+    Preserves: all system + first non-system message + last keep_last messages.
+    Inserts a marker message about the dropped part.
+
     Returns (body, number_of_messages_removed).
     """
     if max_tokens <= 0:
         return body, 0
 
     messages = body.get("messages", [])
-    if len(messages) <= keep_last:
+    if not isinstance(messages, list) or not messages:
         return body, 0
 
-    # Rough estimate: ~3 chars per token
-    char_budget = max_tokens * 3
+    est = _estimate_messages_chars(messages) // 3
+    if est <= max_tokens:
+        return body, 0
 
-    # Always preserve system messages
-    system_msgs = [m for m in messages if m.get("role") == "system"]
-    non_system = [m for m in messages if m.get("role") != "system"]
-
-    # Keep only the last keep_last messages
-    kept = non_system[-keep_last:] if len(non_system) > keep_last else non_system
-
-    # Check character budget
-    def _msg_chars(m: dict[str, Any]) -> int:
-        c = m.get("content", "")
-        if isinstance(c, str):
-            return len(c)
-        if isinstance(c, list):
-            return sum(len(p.get("text", "")) for p in c if isinstance(p, dict))
-        return 0
-
-    removed_count = len(messages) - len(system_msgs) - len(kept)
-    total = sum(_msg_chars(m) for m in system_msgs + kept)
-    while kept and total > char_budget:
-        removed = kept.pop(0)
-        removed_count += 1
-        total -= _msg_chars(removed)
-
-    new_messages = system_msgs + kept
-    return {**body, "messages": new_messages}, removed_count
+    systems = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
+    rest = [m for m in messages if isinstance(m, dict) and m.get("role") != "system"]
+    first = rest[:1]
+    tail = rest[1:][-keep_last:] if keep_last > 0 else []
+    marker = {
+        "role": "user",
+        "content": (
+            f"[proxy] Часть истории диалога опущена для укладки в контекст "
+            f"(~{est} токенов до обрезки, лимит {max_tokens})."
+        ),
+    }
+    new_messages = systems + first + [marker] + tail
+    removed = len(messages) - len(new_messages)
+    return {**body, "messages": new_messages}, removed
 
 
 class ProxyController:
@@ -128,6 +139,11 @@ class ProxyController:
                 headers: dict[str, str] = {}
                 if self._cfg.api_key:
                     headers["Authorization"] = f"Bearer {self._cfg.api_key}"
+                else:
+                    # Forward client's Authorization header (passthrough)
+                    auth = request.headers.get("Authorization", "")
+                    if auth:
+                        headers["Authorization"] = auth
                 async with s.get(
                     f"{self._cfg.upstream_base}/v1/models",
                     headers=headers,
@@ -150,6 +166,9 @@ class ProxyController:
         t_start = time.monotonic()
         summary = RequestSummary(think_mode=self._cfg.think_mode, t_start=t_start)
 
+        # Capture client headers for Authorization passthrough
+        client_headers: dict[str, str] = dict(request.headers)
+
         # --- Read request body ---
         try:
             body: dict[str, Any] = await request.json()
@@ -159,7 +178,7 @@ class ProxyController:
                 status=400,
             )
 
-        _debug_log("request_in", {"model": body.get("model"), "stream": body.get("stream"), "msg_count": len(body.get("messages", [])), "headers": dict(request.headers)})
+        _debug_log("request_in", {"model": body.get("model"), "stream": body.get("stream"), "msg_count": len(body.get("messages", [])), "headers": client_headers})
 
         # --- Request transformation pipeline (collecting summary facts) ---
         original_model = body.get("model", "unknown")
@@ -177,12 +196,6 @@ class ProxyController:
 
         body, stripped = self._strip_think_history(body)
         summary.stripped_think = stripped
-
-        body, nulled = self._strip_tool_call_content(body)
-        summary.nulled_tool_content = nulled
-
-        body, renamed = self._fix_empty_tool_names(body)
-        summary.renamed_tool_calls = renamed
 
         body, trimmed = _enforce_context_budget(
             body,
@@ -205,9 +218,9 @@ class ProxyController:
             _debug_log("upstream_body", json.dumps(body, ensure_ascii=False))
         try:
             if is_stream:
-                return await self._stream_response(request, body, model, messages, t_start, summary)
+                return await self._stream_response(request, body, model, messages, t_start, summary, client_headers)
             else:
-                return await self._handle_json(body, model, messages, t_start, summary)
+                return await self._handle_json(body, model, messages, t_start, summary, client_headers)
         except UpstreamError as exc:
             _debug_log("upstream_error", {"status": exc.status, "body": exc.body})
             summary.status = exc.status or 502
@@ -240,56 +253,13 @@ class ProxyController:
         new_messages = inject_instructions(messages, self._cfg.custom_instructions)
         return {**body, "messages": new_messages}
 
-    def _strip_tool_call_content(self, body: dict[str, Any]) -> tuple[dict[str, Any], int]:
-        """Remove the content key from assistant messages that carry tool_calls.
-
-        The Moonshot tokenizer rejects messages where tool_calls and any
-        content coexist ("Invalid request: tokenization failed"), so the
-        key is dropped entirely. Returns (body, count_fixed).
-        """
-        messages = body.get("messages", [])
-        new_messages = []
-        fixed = 0
-        for msg in messages:
-            if (
-                msg.get("role") == "assistant"
-                and msg.get("tool_calls")
-                and msg.get("content") is not None
-            ):
-                msg = {k: v for k, v in msg.items() if k != "content"}
-                fixed += 1
-            new_messages.append(msg)
-        return {**body, "messages": new_messages}, fixed
-
-    def _fix_empty_tool_names(self, body: dict[str, Any]) -> tuple[dict[str, Any], int]:
-        """Replace empty/missing tool_call function names with a placeholder.
-
-        The Moonshot tokenizer crashes ("Invalid request: tokenization
-        failed") on any tool_call whose function.name is empty. Returns
-        (body, count_fixed).
-        """
-        messages = body.get("messages", [])
-        new_messages = []
-        fixed = 0
-        for msg in messages:
-            tool_calls = msg.get("tool_calls")
-            if tool_calls:
-                changed = False
-                new_calls = []
-                for tc in tool_calls:
-                    fn = tc.get("function") or {}
-                    if not fn.get("name"):
-                        tc = {**tc, "function": {**fn, "name": "tool"}}
-                        changed = True
-                    new_calls.append(tc)
-                if changed:
-                    msg = {**msg, "tool_calls": new_calls}
-                    fixed += 1
-            new_messages.append(msg)
-        return {**body, "messages": new_messages}, fixed
-
     def _strip_think_history(self, body: dict[str, Any]) -> tuple[dict[str, Any], int]:
-        """Strip think-blocks from message history. Returns (body, count_cleaned)."""
+        """Strip think-blocks from message history. Returns (body, count_cleaned).
+
+        Handles the case where stripping leaves empty content:
+        - assistant with tool_calls → content = None
+        - assistant without tool_calls → content = ' ' (avoids Moonshot 400)
+        """
         if not self._cfg.strip_think_from_history:
             return body, 0
 
@@ -300,8 +270,28 @@ class ProxyController:
             if msg.get("role") == "assistant":
                 content = msg.get("content", "")
                 if isinstance(content, str) and ("<think>" in content or "<details>" in content):
-                    msg = {**msg, "content": strip_think(content)}
+                    stripped_content = strip_think(content)
+                    # Handle empty content after stripping
+                    if stripped_content.strip():
+                        msg = {**msg, "content": stripped_content}
+                    else:
+                        msg = {**msg, "content": None if msg.get("tool_calls") else " "}
                     cleaned += 1
+                elif isinstance(content, list):
+                    new_parts = []
+                    part_cleaned = False
+                    for part in content:
+                        if (
+                            isinstance(part, dict)
+                            and isinstance(part.get("text"), str)
+                            and ("<think>" in part["text"] or "<details>" in part["text"])
+                        ):
+                            part = {**part, "text": strip_think(part["text"])}
+                            part_cleaned = True
+                        new_parts.append(part)
+                    if part_cleaned:
+                        msg = {**msg, "content": new_parts}
+                        cleaned += 1
             new_messages.append(msg)
         return {**body, "messages": new_messages}, cleaned
 
@@ -317,11 +307,61 @@ class ProxyController:
         messages: list[dict[str, Any]],
         t_start: float,
         summary: RequestSummary,
+        client_headers: dict[str, str] | None = None,
     ) -> web.StreamResponse:
         """Streaming response: read upstream SSE, transform, send to client."""
-        resp, attempts = await self._upstream.post_stream(body)
+        resp, attempts = await self._upstream.post_stream(body, client_headers)
         summary.attempts = attempts
         summary.retried = attempts > 1
+
+        # Check if upstream returned non-SSE (e.g. JSON error with 200 status)
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/event-stream" not in content_type.lower():
+            # Upstream returned regular JSON instead of SSE
+            data = await resp.read()
+            resp.close()
+            try:
+                json_data = json.loads(data)
+            except (json.JSONDecodeError, ValueError):
+                json_data = None
+
+            if json_data and json_data.get("choices"):
+                # Convert full JSON response to SSE
+                from .transform import transform_full_response, full_response_to_sse
+                json_data = transform_full_response(json_data, self._cfg.think_mode, model)
+                sse_lines = full_response_to_sse(json_data, model)
+                stream = web.StreamResponse(
+                    status=200,
+                    headers={
+                        "Content-Type": "text/event-stream",
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+                await stream.prepare(request)
+                for line_bytes in sse_lines:
+                    await stream.write(line_bytes)
+                await stream.write_eof()
+
+                # Log usage from the JSON response
+                usage_data = json_data.get("usage")
+                summary.usage = usage_data
+                summary.finish()
+                print_summary(summary, self._cfg.console_enabled)
+                total_ms = (time.monotonic() - t_start) * 1000
+                self._usage.log(model, usage_data, None, total_ms, attempts, messages)
+                self._metrics.log(model, None, total_ms, 200, attempts)
+                return stream
+            else:
+                # No choices — forward as-is
+                summary.finish()
+                print_summary(summary, self._cfg.console_enabled)
+                return web.Response(
+                    body=data,
+                    status=resp.status,
+                    content_type=content_type,
+                )
 
         stream = web.StreamResponse(
             status=200,
@@ -338,6 +378,7 @@ class ProxyController:
         ttft: float | None = None
         usage_data: dict[str, Any] | None = None
         chunk_count = 0
+        saw_choices = False
 
         try:
             async for raw_line in resp.content:
@@ -361,6 +402,32 @@ class ProxyController:
                             usage_data = payload["usage"]
                     except (json.JSONDecodeError, KeyError):
                         pass
+
+                # Detect upstream error events in SSE
+                if raw_text.startswith("data: ") and '"error"' in raw_text:
+                    try:
+                        payload = json.loads(raw_text[6:].strip())
+                        if isinstance(payload, dict) and payload.get("error"):
+                            err = payload["error"]
+                            err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                            _debug_log("sse_upstream_error", err_msg)
+                            from .transform import _make_chunk, sse_line as make_sse
+                            err_chunk = _make_chunk(transformer.template, 0, {"content": f"\n\n[upstream error] {err_msg}"}, "stop")
+                            await stream.write(make_sse(err_chunk))
+                            chunk_count += 1
+                            continue
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+                # Track whether we've seen choices (for the no-choices guard)
+                if raw_text.startswith("data: ") and '"choices"' in raw_text:
+                    try:
+                        payload = json.loads(raw_text[6:].strip())
+                        if isinstance(payload, dict) and payload.get("choices"):
+                            saw_choices = True
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
                 out_lines = transformer.transform_line(line if isinstance(line, bytes) else line.encode())
                 for out_line in out_lines:
                     chunk_count += 1
@@ -372,6 +439,19 @@ class ProxyController:
                 if line == b"data: [DONE]" or line == "data: [DONE]":
                     break
 
+            # Stream ended without any choices — send a warning instead of
+            # letting VS Code crash with "Response contained no choices"
+            if not saw_choices:
+                warn_msg = (
+                    f"\n\n[proxy] Апстрим завершил стрим без choices (HTTP {resp.status}). "
+                    f"Проверь upstream_base ({self._cfg.upstream_base}), API-ключ и имя модели."
+                )
+                _debug_log("stream_no_choices", {"status": resp.status})
+                from .transform import _make_chunk, sse_line as make_sse
+                warn_chunk = _make_chunk(transformer.template, 0, {"content": warn_msg}, "stop")
+                await stream.write(make_sse(warn_chunk))
+                await stream.write(b"data: [DONE]\n\n")
+
         except (ConnectionResetError, aiohttp.ClientError, asyncio.CancelledError):
             summary.status = "client disconnected"
         finally:
@@ -381,7 +461,7 @@ class ProxyController:
             except Exception:
                 pass
 
-        _debug_log("stream_done", {"chunks_sent": chunk_count, "ttft_ms": ttft, "usage": usage_data})
+        _debug_log("stream_done", {"chunks_sent": chunk_count, "ttft_ms": ttft, "usage": usage_data, "saw_choices": saw_choices})
 
         total_ms = (time.monotonic() - t_start) * 1000
 
@@ -407,9 +487,10 @@ class ProxyController:
         messages: list[dict[str, Any]],
         t_start: float,
         summary: RequestSummary,
+        client_headers: dict[str, str] | None = None,
     ) -> web.Response:
         """Handle non-stream request."""
-        result = await self._upstream.post_json(body)
+        result = await self._upstream.post_json(body, client_headers)
         total_ms = (time.monotonic() - t_start) * 1000
 
         _debug_log("upstream_response", {"choices": len(result.get("choices", [])), "has_content": bool(result.get("choices", [{}])[0].get("message", {}).get("content")), "usage": result.get("usage")})
