@@ -1,0 +1,47 @@
+# --- Python bytecode / caches ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Packaging ---
+*.egg-info/
+dist/
+build/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Secrets ---
+.env
+*.key
+
+# --- Proxy runtime artifacts (created on every run) ---
+*.jsonl
+kimi-proxy-usage.jsonl
+kimi-proxy-metrics.jsonl
+kimi-proxy-breakdown.jsonl
+*.log
+logs/
+
+# --- Local config overrides (real API keys may live here) ---
+kimi-proxy.local.json
+
+# --- IDE / OS noise ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.code-workspace
+
+# --- Tests ---
+tests/
+
+# --- Downloaded binaries (not source code) ---
+bin/
+
