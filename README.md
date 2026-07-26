@@ -22,6 +22,12 @@ VS Code Copilot Chat supports custom OpenAI-compatible endpoints, but Kimi's rea
 - **JSONC config** — human-friendly config with comments
 - **Async & concurrent** — handles multiple simultaneous requests via aiohttp
 
+## Screenshots
+
+![Startup banner](screen2.PNG)
+
+![Request summary](screen1.jpg)
+
 ## Setup
 
 ### 1. Install dependencies
@@ -124,6 +130,7 @@ All settings live in `kimi-proxy.json` (JSONC — comments allowed):
 | `emoji` | `auto` | Emoji in console: `auto`, `on`, `off` (auto detects VS Code terminal → off) |
 | `logging_enabled` | `true` | Master switch for all JSONL file logging |
 | `debug_dump_body` | `false` | Dump outgoing upstream request body to `kimi-proxy-debug.jsonl` |
+| `client_max_size` | `52428800` (50 MB) | Max request body size in bytes (aiohttp default is 1 MB) |
 | `usage_log` | `""` (off) | Token usage log file (shipped config: `kimi-proxy-usage.jsonl`) |
 | `metrics_log` | `""` (off) | Latency metrics log file (shipped config: `kimi-proxy-metrics.jsonl`) |
 | `usage_breakdown` | `true` | Log prompt breakdown by category |

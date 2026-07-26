@@ -26,7 +26,7 @@ async def create_app(cfg: ProxyConfig) -> web.Application:
     metrics_logger = MetricsLogger(cfg)
     controller = ProxyController(cfg, session, usage_logger, metrics_logger)
 
-    app = web.Application(client_max_size=50 * 1024 * 1024)  # 50 MB
+    app = web.Application(client_max_size=cfg.client_max_size)
     app.router.add_get("/v1/models", controller.handle_models)
     app.router.add_post("/v1/chat/completions", controller.handle_chat_completions)
 

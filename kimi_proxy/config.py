@@ -109,6 +109,7 @@ _DEFAULTS: dict[str, Any] = {
     "usage_breakdown": True,
     "usage_breakdown_log": "",
     "logging_enabled": True,          # master switch: JSONL file logging
+    "client_max_size": 52428800,      # max request body size in bytes (50 MB)
     "retry": {
         "max_attempts": 3,
         "backoff": [2, 4, 8],
@@ -166,6 +167,7 @@ class ProxyConfig:
     usage_breakdown_log: str = ""
     logging_enabled: bool = True
     debug_dump_body: bool = False
+    client_max_size: int = 52428800  # 50 MB
     retry: RetryConfig = field(default_factory=RetryConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     rtk: RtkConfig = field(default_factory=RtkConfig)
@@ -225,6 +227,7 @@ class ProxyConfig:
             usage_breakdown_log=str(merged.get("usage_breakdown_log", "")),
             logging_enabled=bool(merged.get("logging_enabled", True)),
             debug_dump_body=bool(merged.get("debug_dump_body", False)),
+            client_max_size=int(merged.get("client_max_size", 52428800)),
             retry=retry,
             context=context,
             rtk=rtk,
