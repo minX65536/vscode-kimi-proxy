@@ -163,7 +163,18 @@ class ProxyController:
         # --- Read request body ---
         try:
             body: dict[str, Any] = await request.json()
-        except Exception:
+        except Exception as exc:
+            raw = await request.read()
+            self._debug_log(
+                "request_in_invalid_json",
+                {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "content_encoding": request.headers.get("Content-Encoding", ""),
+                    "content_type": request.headers.get("Content-Type", ""),
+                    "body_bytes": len(raw),
+                    "body_head_hex": raw[:64].hex(),
+                },
+            )
             return web.json_response(
                 {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
                 status=400,
