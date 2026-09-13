@@ -97,6 +97,7 @@ class RequestSummary:
     status: int | str = 200
     usage: dict[str, Any] | None = None
     messages: list[dict[str, Any]] = field(default_factory=list)
+    cumulative_total: int | None = None  # cumulative total tokens since server start
 
     def finish(self) -> None:
         """Stamp the total duration."""
@@ -167,6 +168,8 @@ class RequestSummary:
             f"  {c.GRAY}out{c.RESET} {c.fmt_tokens(completion_t)}"
             f"  {c.GRAY}{c.icon('Σ', '=')}{c.RESET} {c.fmt_tokens(u.get('total_tokens'))}"
         )
+        if self.cumulative_total is not None:
+            tokens += f"  {c.GRAY}{c.icon('🧮')} since start {c.fmt_tokens(self.cumulative_total)}{c.RESET}"
 
         lines = [header, "", "  ".join(pipe_bits), timing, tokens]
 
@@ -212,11 +215,36 @@ def print_summary(summary: RequestSummary, verbose: bool) -> None:
         print(summary.render(), flush=True)
 
 
+def attach_cumulative_total(summary: RequestSummary, usage_logger: UsageLogger) -> None:
+    """Fill the cumulative total on a summary from the logger's counters."""
+    if summary.usage:
+        summary.cumulative_total = usage_logger.totals["total_tokens"]
+
+
 class UsageLogger:
-    """Usage data logging."""
+    """Usage data logging + in-memory cumulative token totals."""
 
     def __init__(self, cfg: ProxyConfig) -> None:
         self._cfg = cfg
+        self._totals: dict[str, Any] = {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "by_model": {},
+        }
+
+    @property
+    def totals(self) -> dict[str, Any]:
+        """Cumulative token totals since server start (read-only copy)."""
+        t = self._totals
+        return {
+            "requests": t["requests"],
+            "prompt_tokens": t["prompt_tokens"],
+            "completion_tokens": t["completion_tokens"],
+            "total_tokens": t["total_tokens"],
+            "by_model": {m: dict(v) for m, v in t["by_model"].items()},
+        }
 
     def log(
         self,
@@ -241,6 +269,18 @@ class UsageLogger:
             "total_ms": round(total_ms) if total_ms else None,
             "attempts": attempts,
         }
+
+        # Cumulative in-memory totals
+        t = self._totals
+        t["requests"] += 1
+        m = t["by_model"].setdefault(
+            model, {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        )
+        m["requests"] += 1
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            val = usage.get(key) or 0
+            t[key] += val
+            m[key] += val
 
         # Console output is handled by the RequestSummary box — JSONL only here.
         if self._cfg.logging_enabled and self._cfg.usage_log:

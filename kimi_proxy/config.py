@@ -98,9 +98,9 @@ _DEFAULTS: dict[str, Any] = {
         "top_p": 0.95,
     },
     "think_mode": "inline",          # inline | details | native | drop
-    "strip_think_from_history": True,
+    "strip_think_from_history": False,
     "model_aliases": {},
-    "custom_instructions": "",        # highest-priority system instructions
+    "custom_instructions": "Do not use <think> tags. Do not wrap reasoning in <think> or <details>. Provide direct answers without thinking blocks.",
     "usage_log": "",
     "console": True,                  # master switch: pretty console output
     "verbose": True,

@@ -47,10 +47,18 @@ def _make_debug_logger(cfg: ProxyConfig) -> Any:
 
 from .config import ProxyConfig
 from .instructions import inject_instructions
-from .logging_svc import MetricsLogger, RequestSummary, UsageLogger, _estimate_chars, print_summary
+from .logging_svc import (
+    MetricsLogger,
+    RequestSummary,
+    UsageLogger,
+    _estimate_chars,
+    attach_cumulative_total,
+    print_summary,
+)
 from .rtk import compress_tool_outputs, find_rtk_binary
 from .thinking import strip_think
 from .transform import (
+    _make_chunk,
     create_transformer,
     full_response_to_sse,
     sse_line,
@@ -122,6 +130,10 @@ class ProxyController:
         self._usage = usage_logger
         self._metrics = metrics_logger
         self._debug_log = _make_debug_logger(cfg)
+
+    async def handle_stats(self, request: web.Request) -> web.Response:
+        """GET /stats — cumulative token totals since server start."""
+        return web.json_response(self._usage.totals)
 
     async def handle_models(self, request: web.Request) -> web.Response:
         """GET /v1/models — proxy the model list."""
@@ -394,47 +406,99 @@ class ProxyController:
         usage_data: dict[str, Any] | None = None
         chunk_count = 0
         saw_choices = False
+        buffer = b""  # Buffer for incomplete SSE lines
 
         try:
-            async for raw_line in resp.content:
+            # Use readany() instead of async-for-line to prevent hanging
+            # on incomplete lines. 8192 bytes chunks with 120s timeout.
+            # After finish_reason, reduce timeout to 5s — upstream may not send [DONE]
+            read_timeout = 120.0
+            while True:
+                try:
+                    chunk_data = await asyncio.wait_for(resp.content.readany(), timeout=read_timeout)
+                except asyncio.TimeoutError:
+                    self._debug_log("sse_read_timeout", {"elapsed_s": read_timeout})
+                    # Don't send [DONE] — let client handle timeout
+                    break
+                except (ConnectionResetError, aiohttp.ClientError):
+                    # Upstream closed connection
+                    break
+
+                if not chunk_data:
+                    # EOF from upstream
+                    break
+
                 if ttft is None:
                     ttft = (time.monotonic() - t_start) * 1000
 
-                line = raw_line.strip()
-                if not line:
+                buffer += chunk_data
+
+                # Process complete lines
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    line = line.rstrip(b"\r")
+                    if not line:
+                        continue
+
+                    # Transform each SSE line
+                    raw_text = line.decode("utf-8", errors="replace")
+                    self._debug_log("sse_upstream", raw_text)
+                    # Intercept usage data from the RAW upstream line.
+                    if raw_text.startswith("data: ") and '"usage"' in raw_text:
+                        try:
+                            payload = json.loads(raw_text[6:].strip())
+                            if isinstance(payload, dict) and payload.get("usage"):
+                                usage_data = payload["usage"]
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+
+                    # Detect upstream error events in SSE
+                    if raw_text.startswith("data: ") and '"error"' in raw_text:
+                        try:
+                            payload = json.loads(raw_text[6:].strip())
+                            if isinstance(payload, dict) and payload.get("error"):
+                                err = payload["error"]
+                                err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                                self._debug_log("sse_upstream_error", err_msg)
+                                err_chunk = _make_chunk(transformer.template, 0, {"content": f"\n\n[upstream error] {err_msg}"}, "stop")
+                                await stream.write(sse_line(err_chunk))
+                                chunk_count += 1
+                                continue
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+
+                    # Track whether we've seen choices
+                    if raw_text.startswith("data: ") and '"choices"' in raw_text:
+                        try:
+                            payload = json.loads(raw_text[6:].strip())
+                            if isinstance(payload, dict) and payload.get("choices"):
+                                saw_choices = True
+                                # After finish_reason, reduce timeout — upstream may not send [DONE]
+                                if payload["choices"][0].get("finish_reason"):
+                                    read_timeout = 5.0
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+
+                    out_lines = transformer.transform_line(line)
+                    for out_line in out_lines:
+                        chunk_count += 1
+                        text = out_line.decode("utf-8", errors="replace")
+                        self._debug_log("sse_client", text)
+                        await stream.write(out_line)
+
+                    # If this is [DONE]
+                    if line == b"data: [DONE]":
+                        break
+                else:
+                    # Continue outer loop if no [DONE] found
                     continue
+                # [DONE] found, exit outer loop
+                break
 
-                # Transform each SSE line
-                raw_text = line if isinstance(line, str) else line.decode("utf-8", errors="replace")
-                self._debug_log("sse_upstream", raw_text)
-                # Intercept usage data from the RAW upstream line.
-                # Transformers may drop usage-only chunks (empty choices), so
-                # scanning transformed output would miss standalone usage chunks.
-                if raw_text.startswith("data: ") and '"usage"' in raw_text:
-                    try:
-                        payload = json.loads(raw_text[6:].strip())
-                        if isinstance(payload, dict) and payload.get("usage"):
-                            usage_data = payload["usage"]
-                    except (json.JSONDecodeError, KeyError):
-                        pass
-
-                # Detect upstream error events in SSE
-                if raw_text.startswith("data: ") and '"error"' in raw_text:
-                    try:
-                        payload = json.loads(raw_text[6:].strip())
-                        if isinstance(payload, dict) and payload.get("error"):
-                            err = payload["error"]
-                            err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                            self._debug_log("sse_upstream_error", err_msg)
-                            from .transform import _make_chunk, sse_line as make_sse
-                            err_chunk = _make_chunk(transformer.template, 0, {"content": f"\n\n[upstream error] {err_msg}"}, "stop")
-                            await stream.write(make_sse(err_chunk))
-                            chunk_count += 1
-                            continue
-                    except (json.JSONDecodeError, KeyError):
-                        pass
-
-                # Track whether we've seen choices (for the no-choices guard)
+            # Process any remaining data in buffer
+            if buffer and not saw_choices:
+                # Try to parse remaining buffer as final chunk
+                raw_text = buffer.decode("utf-8", errors="replace").strip()
                 if raw_text.startswith("data: ") and '"choices"' in raw_text:
                     try:
                         payload = json.loads(raw_text[6:].strip())
@@ -443,36 +507,23 @@ class ProxyController:
                     except (json.JSONDecodeError, KeyError):
                         pass
 
-                out_lines = transformer.transform_line(line if isinstance(line, bytes) else line.encode())
-                for out_line in out_lines:
-                    chunk_count += 1
-                    text = out_line.decode("utf-8", errors="replace")
-                    self._debug_log("sse_client", text)
-                    await stream.write(out_line)
-
-                # If this is [DONE]
-                if line == b"data: [DONE]" or line == "data: [DONE]":
-                    break
-
-            # Stream ended without any choices — send a warning instead of
-            # letting VS Code crash with "Response contained no choices"
+            # Stream ended without any choices — send a warning
             if not saw_choices:
                 warn_msg = (
                     f"\n\n[proxy] Апстрим завершил стрим без choices (HTTP {resp.status}). "
                     f"Проверь upstream_base ({self._cfg.upstream_base}), API-ключ и имя модели."
                 )
                 self._debug_log("stream_no_choices", {"status": resp.status})
-                from .transform import _make_chunk, sse_line as make_sse
                 warn_chunk = _make_chunk(transformer.template, 0, {"content": warn_msg}, "stop")
-                await stream.write(make_sse(warn_chunk))
-                await stream.write(b"data: [DONE]\n\n")
+                await stream.write(sse_line(warn_chunk))
+                # Don't send [DONE] — let client handle it
 
         except (ConnectionResetError, aiohttp.ClientError, asyncio.CancelledError):
             summary.status = "client disconnected"
         finally:
             resp.close()
             try:
-                await stream.write_eof()
+                await asyncio.wait_for(stream.write_eof(), timeout=5.0)
             except Exception:
                 pass
 
@@ -480,14 +531,16 @@ class ProxyController:
 
         total_ms = (time.monotonic() - t_start) * 1000
 
-        # Logging + pretty console summary
+        # Logging first so cumulative totals include this request
+        self._usage.log(model, usage_data, ttft, total_ms, attempts, messages)
+        self._metrics.log(model, ttft, total_ms, 200, attempts)
+
+        # Pretty console summary
         summary.ttft_ms = ttft
         summary.usage = usage_data
         summary.finish()
+        attach_cumulative_total(summary, self._usage)
         print_summary(summary, self._cfg.console_enabled)
-
-        self._usage.log(model, usage_data, ttft, total_ms, attempts, messages)
-        self._metrics.log(model, ttft, total_ms, 200, attempts)
 
         return stream
 
@@ -515,13 +568,15 @@ class ProxyController:
 
         self._debug_log("client_response", {"choices": len(result.get("choices", []))})
 
-        # Logging + pretty console summary
+        # Logging first so cumulative totals include this request
         usage_data = result.get("usage")
-        summary.usage = usage_data
-        summary.finish()
-        print_summary(summary, self._cfg.console_enabled)
-
         self._usage.log(model, usage_data, None, total_ms, 1, messages)
         self._metrics.log(model, None, total_ms, 200, 1)
+
+        # Pretty console summary
+        summary.usage = usage_data
+        summary.finish()
+        attach_cumulative_total(summary, self._usage)
+        print_summary(summary, self._cfg.console_enabled)
 
         return web.json_response(result)

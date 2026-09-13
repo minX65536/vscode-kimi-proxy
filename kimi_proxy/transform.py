@@ -97,13 +97,15 @@ class ThinkTransformer:
 
         # Keep stream identity for potential synthetic chunks
         self.template = {
-            k: chunk.get(k) for k in ("id", "created", "model") if chunk.get(k)
+            k: chunk.get(k) for k in ("id", "created", "model", "system_fingerprint") if chunk.get(k)
         }
 
         if chunk.get("choices"):
             return [sse_line(c) for c in self._transform_chunk(chunk)]
 
-        # usage-only / error chunks — forward as-is
+        # usage-only / error chunks — forward as-is, but add system_fingerprint if missing
+        if self.template.get("system_fingerprint") and not chunk.get("system_fingerprint"):
+            chunk["system_fingerprint"] = self.template["system_fingerprint"]
         return [sse_line(chunk)]
 
 
@@ -130,23 +132,23 @@ class InlineThinkTransformer(ThinkTransformer):
 
             reasoning = delta.get("reasoning_content")
             if reasoning:
-                prefix = self._open_marker() if idx not in self.state.open else ""
-                self.state.open.add(idx)
-                new_delta = {k: v for k, v in delta.items() if k != "reasoning_content"}
-                new_delta["content"] = prefix + reasoning + (new_delta.get("content") or "")
-                choice["delta"] = new_delta
+                # Don't wrap reasoning in think tags — pass through as-is
+                pass
             elif idx in self.state.open and (
                 delta.get("content") or delta.get("tool_calls") or choice.get("finish_reason")
             ):
-                self.state.open.discard(idx)
                 if delta.get("content") is not None:
-                    delta["content"] = self._close_marker() + (delta.get("content") or "")
-                else:
-                    # tool_calls without content — close think via a separate
-                    # synthetic chunk so the tool_calls delta stays untouched.
-                    extra.append(
-                        _make_chunk(self.template, idx, {"content": self._close_marker()})
-                    )
+                    # Content closes think tag
+                    self.state.open.discard(idx)
+                    # Don't add close marker — let content flow naturally
+                elif delta.get("tool_calls"):
+                    # tool_calls without content — keep think open, pass through as-is.
+                    # Think will be closed when content arrives or on finish_reason.
+                    pass
+                elif choice.get("finish_reason"):
+                    # Don't close think on finish_reason — it breaks VS Code tool flow.
+                    # Think stays open, VS Code will handle it.
+                    pass
         return extra + [chunk]
 
 

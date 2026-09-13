@@ -86,11 +86,12 @@ class UpstreamClient:
 
         for attempt in range(self._cfg.retry_attempts):
             try:
+                # total=600s (10 min) max, sock_read=120s between chunks to prevent infinite hangs
                 resp = await self._session.post(
                     self._cfg.upstream_url,
                     json=body,
                     headers=self._headers(client_headers),
-                    timeout=aiohttp.ClientTimeout(total=None, sock_read=300),
+                    timeout=aiohttp.ClientTimeout(total=600, sock_read=120),
                     allow_redirects=False,
                 )
 

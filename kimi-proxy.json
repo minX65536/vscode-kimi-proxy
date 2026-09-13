@@ -36,7 +36,11 @@
   // Custom instructions for the model with HIGHEST priority.
   // Inserted BEFORE IDE instructions in the system message.
   // "" = do not add.
-  "custom_instructions": "",
+  "custom_instructions": [
+    "GOD level rules:",
+    "1. rule #1",
+    "2. rule #2"
+  ],
 
   // ================= MODELS =================
   // Name remapping: "what the client sends": "what goes to the API".
@@ -57,11 +61,11 @@
 
   // ================= LOGGING =================
   // Master switch for ALL JSONL file logging (false = write nothing).
-  "logging_enabled": true,
+  "logging_enabled": false,
 
   // Dump the outgoing upstream request body into kimi-proxy-debug.jsonl
   // (temporary diagnostic for the "tokenization failed" 400 error).
-  "debug_dump_body": true,
+  "debug_dump_body": false,
 
   // Usage log (jsonl): tokens per request. "" = off.
   "usage_log": "kimi-proxy-usage.jsonl",
@@ -86,7 +90,7 @@
   // the MIDDLE of the history is dropped (kept: system + first message + last keep_last).
   "context": {
     "max_tokens": 0,   // 0 = disabled; e.g. 100000 for kimi-k3
-    "keep_last": 20    // how many recent messages are guaranteed to be kept
+    "keep_last": 50    // how many recent messages are guaranteed to be kept
   },
 
   // ================= RTK (tool output compression) =================
