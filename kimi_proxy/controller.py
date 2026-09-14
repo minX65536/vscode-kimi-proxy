@@ -399,7 +399,15 @@ class ProxyController:
                 "X-Accel-Buffering": "no",
             },
         )
-        await stream.prepare(request)
+        try:
+            await stream.prepare(request)
+        except (ConnectionResetError, aiohttp.ClientError, asyncio.CancelledError):
+            # Client disconnected before SSE headers were sent
+            resp.close()
+            summary.status = "client disconnected"
+            summary.finish()
+            print_summary(summary, self._cfg.console_enabled)
+            return stream
 
         transformer = create_transformer(self._cfg.think_mode, model)
         ttft: float | None = None
