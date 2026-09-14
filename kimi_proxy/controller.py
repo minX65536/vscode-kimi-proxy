@@ -138,26 +138,25 @@ class ProxyController:
     async def handle_models(self, request: web.Request) -> web.Response:
         """GET /v1/models — proxy the model list."""
         try:
-            async with aiohttp.ClientSession() as s:
-                headers: dict[str, str] = {}
-                if self._cfg.api_key:
-                    headers["Authorization"] = f"Bearer {self._cfg.api_key}"
-                else:
-                    # Forward client's Authorization header (passthrough)
-                    auth = request.headers.get("Authorization", "")
-                    if auth:
-                        headers["Authorization"] = auth
-                async with s.get(
-                    f"{self._cfg.upstream_base}/v1/models",
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    body = await resp.read()
-                    return web.Response(
-                        body=body,
-                        status=resp.status,
-                        content_type="application/json",
-                    )
+            headers: dict[str, str] = {}
+            if self._cfg.api_key:
+                headers["Authorization"] = f"Bearer {self._cfg.api_key}"
+            else:
+                # Forward client's Authorization header (passthrough)
+                auth = request.headers.get("Authorization", "")
+                if auth:
+                    headers["Authorization"] = auth
+            async with self._upstream._session.get(
+                f"{self._cfg.upstream_base}/v1/models",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                body = await resp.read()
+                return web.Response(
+                    body=body,
+                    status=resp.status,
+                    content_type="application/json",
+                )
         except Exception as exc:
             return web.json_response(
                 {"error": {"message": str(exc), "type": "proxy_error"}},

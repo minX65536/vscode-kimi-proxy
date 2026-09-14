@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import aiohttp
 from aiohttp import web
 
@@ -14,6 +16,14 @@ from . import __version__
 from .config import ProxyConfig
 from .controller import ProxyController
 from .logging_svc import MetricsLogger, UsageLogger
+
+
+def _silence_aiohttp_ctrl_c_noise(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Suppress known aiohttp Windows Ctrl+C noise (InvalidStateError in _handle_request)."""
+    exc = context.get("exception")
+    if isinstance(exc, asyncio.InvalidStateError):
+        return  # aiohttp bug on Ctrl+C, harmless
+    loop.default_exception_handler(context)
 
 
 async def create_app(cfg: ProxyConfig) -> web.Application:
@@ -26,6 +36,9 @@ async def create_app(cfg: ProxyConfig) -> web.Application:
     usage_logger = UsageLogger(cfg)
     metrics_logger = MetricsLogger(cfg)
     controller = ProxyController(cfg, session, usage_logger, metrics_logger)
+
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(_silence_aiohttp_ctrl_c_noise)
 
     app = web.Application(client_max_size=cfg.client_max_size)
     app.router.add_get("/v1/models", controller.handle_models)
@@ -61,7 +74,10 @@ def run_server(cfg: ProxyConfig) -> None:
             host=cfg.listen_host,
             port=cfg.listen_port,
             print=None,  # Suppress default aiohttp banner
+            handler_cancellation=True,  # avoid aiohttp InvalidStateError noise on Ctrl+C
         )
+    except KeyboardInterrupt:
+        pass  # clean Ctrl+C exit
     except OSError as exc:
         if exc.errno in (errno.EADDRINUSE, 10048):  # 10048 = Windows WSAEADDRINUSE
             print(
