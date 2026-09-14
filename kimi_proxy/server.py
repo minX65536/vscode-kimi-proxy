@@ -37,9 +37,6 @@ async def create_app(cfg: ProxyConfig) -> web.Application:
     metrics_logger = MetricsLogger(cfg)
     controller = ProxyController(cfg, session, usage_logger, metrics_logger)
 
-    loop = asyncio.get_event_loop()
-    loop.set_exception_handler(_silence_aiohttp_ctrl_c_noise)
-
     app = web.Application(client_max_size=cfg.client_max_size)
     app.router.add_get("/v1/models", controller.handle_models)
     app.router.add_post("/v1/chat/completions", controller.handle_chat_completions)
@@ -51,10 +48,16 @@ async def create_app(cfg: ProxyConfig) -> web.Application:
 
     app.router.add_get("/health", health)
 
-    # Cleanup
+    # Startup: set exception handler on the actual running loop
+    async def on_startup(app: web.Application) -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(_silence_aiohttp_ctrl_c_noise)
+
+    # Cleanup: close shared session
     async def on_cleanup(app: web.Application) -> None:
         await session.close()
 
+    app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
     return app
