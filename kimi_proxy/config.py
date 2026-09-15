@@ -81,7 +81,29 @@ def _load_jsonc(path: Path) -> dict[str, Any]:
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Error parsing {path}: {exc}") from exc
+        lines = cleaned.split("\n")
+        lineno = exc.lineno
+        colno = exc.colno
+        # Build context: 2 lines before and after
+        ctx_lines: list[str] = []
+        for ln in range(max(1, lineno - 2), min(len(lines), lineno + 2) + 1):
+            marker = " --> " if ln == lineno else "     "
+            text = lines[ln - 1] if ln - 1 < len(lines) else ""
+            # Trim long lines
+            if len(text) > 78:
+                text = text[:75] + "..."
+            ctx_lines.append(f"{marker}{ln:4d} | {text}")
+        pointer = " " * (colno + 9) + "^"
+        context = "\n".join(ctx_lines)
+        msg = (
+            f"\n"
+            f"  ❌ Config parse error: {exc.msg}\n"
+            f"  File: {path}\n"
+            f"  Line {lineno}, column {colno}:\n"
+            f"{context}\n"
+            f"{pointer}\n"
+        )
+        raise ValueError(msg) from None
 
 
 # ---------------------------------------------------------------------------

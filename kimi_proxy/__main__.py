@@ -25,7 +25,11 @@ def main() -> None:
     parser.add_argument("--config", metavar="PATH", default=None, help="Path to kimi-proxy.json config file")
     args = parser.parse_args()
 
-    cfg = ProxyConfig.load(config_path=args.config)
+    try:
+        cfg = ProxyConfig.load(config_path=args.config)
+    except ValueError as exc:
+        print(c.colorize(str(exc), c.PINK), flush=True)
+        raise SystemExit(1) from None
     c.set_emoji_mode(cfg.emoji)
 
     title = c.colorize(f"{c.icon('🌙')} KIMI PROXY v{__version__}", c.CORAL, bold=True)
